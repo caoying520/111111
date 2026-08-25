@@ -38,7 +38,12 @@ def split_by_sm_and_rank(input_csv, output_dir, ascending=False):
         
         # b. 新增 rank 列
         sorted_group['rank'] = sorted_group.index + 1
-        
+        # #按照Biortus No排序输出
+        # sorted_group['Biortus No'] = pd.to_numeric(sorted_group['Biortus No'],errors='coerce')
+        # sorted_group = sorted_group.sort_values(by='Biortus No',ascending=True).reset_index(drop=True)
+
+
+
         # c. 确定文件名：加上序号 i，彻底解决同名覆盖问题
         raw_name = sorted_group['Name'].iloc[0]
         safe_name = sanitize_filename(raw_name)
@@ -59,6 +64,6 @@ def split_by_sm_and_rank(input_csv, output_dir, ascending=False):
     print(f"✅ 处理完成！实际生成文件数: {unique_sm_count}")
     print(f"   输入文件: {input_csv}")
     print(f"   生成文件数: {len(grouped)}")
-    print(f"   保存目录: {os.path.abspath(output_dir)}")
-    print("="*30)    按照Biortus No,Name,SM,pred_Conv,rank
-排序输出
+    print(f"   保存目录: {os.path.abspath(output_dir)}")                                                                                       这个输出是Biortus No,Name,SM,pred_Conv,rank
+67210,67210,C1=CC,0.75397,1，但是我想最终输出是Biortus No列按顺序输出所有csv
+
