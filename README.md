@@ -1,5 +1,5 @@
 import os
-import sys
+import argparse
 import pandas as pd
 
 
@@ -10,7 +10,7 @@ def csv_to_excel(input_dir, output_excel):
         print(f"[!] 错误：找不到输入目录: {input_dir}")
         return
 
-    # 获取 CSV 文件
+    # 获取所有 CSV
     csv_files = [
         f for f in os.listdir(input_dir)
         if f.lower().endswith(".csv")
@@ -19,7 +19,7 @@ def csv_to_excel(input_dir, output_excel):
     # 按文件名排序
     csv_files.sort()
 
-    if len(csv_files) == 0:
+    if not csv_files:
         print(f"[!] 输入目录中没有找到 CSV 文件: {input_dir}")
         return
 
@@ -40,7 +40,7 @@ def csv_to_excel(input_dir, output_excel):
             # 读取 CSV
             df = pd.read_csv(csv_path)
 
-            # Excel Sheet 名称
+            # Sheet 名称使用 CSV 文件名
             sheet_name = os.path.splitext(csv_file)[0]
 
             # Excel Sheet 名最长 31 个字符
@@ -60,19 +60,31 @@ def csv_to_excel(input_dir, output_excel):
     print("=" * 40)
 
 
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="将多个 CSV 文件合并到一个 Excel 文件，每个 CSV 对应一个 Sheet"
+    )
+
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="CSV 文件所在的文件夹"
+    )
+
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="输出 Excel 文件路径，例如 result.xlsx"
+    )
+
+    args = parser.parse_args()
+
+    csv_to_excel(
+        input_dir=args.input,
+        output_excel=args.output
+    )
+
+
 if __name__ == "__main__":
-
-    # 检查命令行参数
-    if len(sys.argv) != 3:
-        print(
-            "用法:\n"
-            "python csv_to_excel.py <CSV文件夹> <输出Excel文件>\n\n"
-            "示例:\n"
-            'python csv_to_excel.py "D:\\result" "D:\\result\\总结果.xlsx"'
-        )
-        sys.exit(1)
-
-    input_dir = sys.argv[1]
-    output_excel = sys.argv[2]
-
-    csv_to_excel(input_dir, output_excel)
+    main()
