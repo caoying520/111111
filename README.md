@@ -134,8 +134,10 @@ class EnzymeSubstrateDataset(Dataset):
 
         activity = self.df["Activity"].astype(float).values
 
-        #标准化Activity
+        #标准化Activity,回归标签
         self.labels = ((activity - activity_mean) / activity_std)
+        # ===== 新增：二分类标签 =====
+        self.binary_labels = (activity >= ACTIVITY_THRESHOLD).astype(np.float32)
 
         
         self.esm_embeds = esm_embeds
@@ -162,7 +164,8 @@ class EnzymeSubstrateDataset(Dataset):
         enz_load = torch.tensor([self.enzyme_norm[i]], dtype=torch.float32)
 
         label = torch.tensor(self.labels[i], dtype=torch.float32)
-        return esm_emb, esm_mask, mol_feat, sm_load, enz_load, label
+        binary_label = torch.tensor(self.labels[i], dtype=torch.float32)
+        return esm_emb, esm_mask, mol_feat, sm_load, enz_load, label,binary_label
 
 
 # ========================
@@ -215,7 +218,10 @@ class EnzymeSubstrateRegressor(nn.Module):
         self.bn2 = nn.BatchNorm1d(hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.bn3 = nn.BatchNorm1d(hidden_dim // 2)
+        #回归头
         self.fc4 = nn.Linear(hidden_dim // 2, 1)
+        #二分类头
+        self.binary_head = nn.Linear(hidden_dim//2,1)
         self.dropout = nn.Dropout(0.2)
 
     def forward(self, esm_feat, esm_mask, mol_feat, sm_load, enz_load):
@@ -262,9 +268,11 @@ class EnzymeSubstrateRegressor(nn.Module):
         x = self.dropout(x)
         x = x + residual
         x = F.relu(self.bn3(self.fc3(x)))
-        x = self.fc4(x)  # [B, 1]
-        return x.squeeze(-1)  # [B]
-
+        #回归输出
+        activity_out = self.fc4(x).squeeze(-1)  # [B, 1]
+        #二分类输出
+        binary_logits=self.binary_head(x).squeeze(-1)
+        return activity_out,binary_logits
 # ============================================================
 # 5. 加载原始模型
 #    除 fc4 外全部继承
@@ -301,6 +309,47 @@ def load_pretrained(model, path, device):
 
 
 # ============================================================
+# 8. 单个 epoch
+# ============================================================
+
+def train_epoch(model,loader,optimizer,criterion,device):
+
+    model.train()
+
+    total_loss = 0
+
+    for esm_feat, esm_mask, mol_feat, sm_load, enz_load, y, binary_y in loader:
+
+        esm_feat = esm_feat.to(device)
+        esm_mask = esm_mask.to(device)
+        mol_feat = mol_feat.to(device)
+        sm_load = sm_load.to(device)
+        enz_load = enz_load.to(device)
+        y = y.to(device)
+        binary_y = binary_y.to(device)
+
+        activity_pred, binary_logits = model(esm_feat,esm_mask,mol_feat,sm_load,enz_load)
+
+        loss_reg = regression_criterion(activity_pred, y)
+        loss_cls = classification_criterion(activity_pred, y)
+        loss =loss_reg +0.5 * loss_cls
+
+        optimizer.zero_grad()
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            5.0
+        )
+
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+# ============================================================
 # 6. 预测
 # ============================================================
 
@@ -322,6 +371,7 @@ def predict(model,loader,device,activity_mean,activity_std):
             out = model(esm_feat,esm_mask,mol_feat,sm_load,enz_load)
 
             preds.extend(out.cpu().numpy())
+            binary_probs.extend(torch.sigmoid(binary_logits).cpu().numpy())
 
             trues.extend(y.numpy())
 
@@ -403,44 +453,6 @@ def evaluate_binary(true,pred,threshold=0.03):
         "FN": cm[1, 0],
         "TP": cm[1, 1]
     }
-
-
-# ============================================================
-# 8. 单个 epoch
-# ============================================================
-
-def train_epoch(model,loader,optimizer,criterion,device):
-
-    model.train()
-
-    total_loss = 0
-
-    for esm_feat, esm_mask, mol_feat, sm_load, enz_load, y in loader:
-
-        esm_feat = esm_feat.to(device)
-        esm_mask = esm_mask.to(device)
-        mol_feat = mol_feat.to(device)
-        sm_load = sm_load.to(device)
-        enz_load = enz_load.to(device)
-        y = y.to(device)
-
-        pred = model(esm_feat,esm_mask,mol_feat,sm_load,enz_load)
-
-        loss = criterion(pred, y)
-
-        optimizer.zero_grad()
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            5.0
-        )
-
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    return total_loss / len(loader)
 
 
 # ============================================================
@@ -619,7 +631,14 @@ def main():
         PRETRAINED_MODEL,
         device)
 
-    criterion = nn.SmoothL1Loss()
+    regression_criterion = nn.SmoothL1Loss()
+
+    classification_criterion = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor(
+            [2.5],
+            device=device
+        )
+    )
 
 
     # ========================================================
@@ -635,13 +654,16 @@ def main():
     for p in model.fc4.parameters():
         p.requires_grad = True   #只解冻fc4
 
-    optimizer = torch.optim.AdamW(model.fc4.parameters(),lr=1e-3,weight_decay=1e-5)  #只优化初始化的fc4权重
+    for p in model.binary_head.parameters():
+            p.requires_grad = True   #只解冻fc4
+
+    optimizer = torch.optim.AdamW(list(model.fc4.parameters()) +list(model.binary_head.parameters()),lr=1e-3,weight_decay=1e-5)
 
     best_f1 = -np.inf
 
     for epoch in range(50):
 
-        loss = train_epoch(model,train_loader,optimizer,criterion,device)
+        loss = train_epoch(model,train_loader,optimizer,regression_criterion,classification_criterion,device)
 
         true_val, pred_val = predict(model,val_loader,device,activity_mean,activity_std)
 
@@ -674,7 +696,7 @@ def main():
 
     optimizer = torch.optim.AdamW(    #低学习率微调,把转化率表征逐渐调整成活性表征
         model.parameters(),
-        lr=1e-5,
+        lr=3e-5,
         weight_decay=1e-5
     )
 
@@ -684,7 +706,7 @@ def main():
 
 
     for epoch in range(500):
-        loss = train_epoch(model,train_loader,optimizer,criterion,device)
+        loss = train_epoch(model,train_loader,optimizer,regression_criterion,classification_criterion,device)
         true_val, pred_val = predict(model,val_loader,device,activity_mean,activity_std)
 
         m = evaluate_binary(true_val,pred_val)
