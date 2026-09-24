@@ -1,350 +1,178 @@
-#                  ┌───────────────┐
-#                  │   ESM2        │
-#                  └───────┬───────┘
-#                          │
-#                          ↓
-#                  ┌───────────────┐
-#                  │ Transformer   │
-#                  └───────┬───────┘
-#                          │
-#                          │
-# MolFormer ───────────────┤
-#                          │
-# Enzyme concentration ───┤
-#                          │
-# Substrate concentration ┤
-#                          ↓
-#                 Multimodal Fusion
-#                          │
-#                          ↓
-#                   FC1 → FC2 → FC3
-#                          │
-#                          ↓
-#                   Binary Classifier
-#                          │
-#                          ↓
-#                     sigmoid
-#                          │
-#                          ↓
-#                  P(Active)
-#                   /          \
-#               < 0.5          ≥ 0.5
-#                 ↓              ↓
-#                 0              1
-#               无活性          有活性
-
 import os
-import random
+import json
+import pickle
 import numpy as np
 import pandas as pd
-import pickle
-
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
-    confusion_matrix
-)
-
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel
+
 
 # ============================================================
-# 搜索最佳阈值
+# 1. 路径
 # ============================================================
 
-def find_best_threshold(y_true, y_prob):
-    best_th, best_f1 = 0.5, -1
+MODEL_PATH = (
+    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
+    "微调/model_Activity_finetune_cls_2/best_model.pth"
+)
 
-    for th in np.arange(0.05, 0.96, 0.01):
-        pred = (y_prob >= th).astype(int)
-        f1 = f1_score(y_true, pred, zero_division=0)
+SCALER_PATH = (
+    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
+    "微调/model_Activity_finetune_cls_2/scaler.json"
+)
 
-        if f1 > best_f1:
-            best_f1 = f1
-            best_th = th
+INPUT_CSV = (
+    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
+    "微调/predict_data.csv"
+)
 
-    return best_th, best_f1
+ESM_PKL = (
+    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
+    "微调/esm_feats_emb_mask_test_6_0.pkl"
+)
+
+MOL_PKL = (
+    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
+    "微调/SM.pkl"
+)
+
+OUTPUT_CSV = (
+    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
+    "微调/model_Activity_finetune_cls_2/predictions.csv"
+)
+
+
 # ============================================================
-# 1. 参数
+# 2. 参数
 # ============================================================
 
-SEED = 123
 BATCH_SIZE = 256
 
-# 原始训练好的模型
-PRETRAINED_MODEL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/enzyme_train/model/reg/model_resnet_krd_conc_S2_KRD_M_55%_add/best_model_add.pth"
+# 注意：
+# 这里是“模型输出概率”的二分类阈值
+# 不是 Activity=0.03
+PRED_THRESHOLD = 0.5
 
-# 新 Activity 数据
-CSV_PATH = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/train_data3.csv"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ESM / MolFormer
-ESM_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/esm_feats_emb_mask_test_6_0.pkl"
-
-MOL_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/SM.pkl"
-
-# split
-SPLIT_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/splits_Activity"
-
-TRAIN_TXT = "train.txt"
-VAL_TXT = "val.txt"
-TEST_TXT = "test.txt"
-
-# 输出
-MODEL_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/model_Activity_finetune_cls_2"
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-# ============================================================
-# Activity 二分类阈值
-# ============================================================
-
-ACTIVITY_THRESHOLD = 0.03
-
-# ============================================================
-# Stage 1
-# ============================================================
-
-STAGE1_EPOCHS = 50
-STAGE1_LR = 1e-3
-
-# ============================================================
-# Stage 2
-# ============================================================
-
-STAGE2_EPOCHS = 500
-STAGE2_LR = 5e-5  #3e-5
-
-WEIGHT_DECAY = 1e-5
-
-
-# ============================================================
-# 2. 固定随机种子
-# ============================================================
-
-def set_seed(seed=123):
-
-    random.seed(seed)
-
-    np.random.seed(seed)
-
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-
-        torch.cuda.manual_seed(seed)
-
-        torch.cuda.manual_seed_all(seed)
-
-    os.environ["PYTHONHASHSEED"] = str(seed)
-
-    torch.backends.cudnn.deterministic = True
-
-    torch.backends.cudnn.benchmark = False
+print("Device:", DEVICE)
+print("Prediction probability threshold:", PRED_THRESHOLD)
 
 
 # ============================================================
 # 3. Dataset
 # ============================================================
 
-class EnzymeSubstrateDataset(Dataset):
+class ActivityPredictionDataset(Dataset):
 
     def __init__(
         self,
         df,
         esm_embeds,
-        mol_embeds
+        mol_embeds,
+        sm_mean,
+        sm_std,
+        enz_mean,
+        enz_std
     ):
 
-        self.df = (
-            df
-            .reset_index(drop=True)
-            .copy()
-        )
-
-        # ----------------------------------------------------
-        # Name
-        # ----------------------------------------------------
-
-        self.idx = (
-            self.df["Name"]
-            .astype(str)
-            .tolist()
-        )
-
-        # ----------------------------------------------------
-        # SMILES
-        # ----------------------------------------------------
-
-        self.smiles = (
-            self.df["SM"]
-            .tolist()
-        )
-
-        # ----------------------------------------------------
-        # Activity
-        # ----------------------------------------------------
-
-        activity = (
-            self.df["Activity"]
-            .astype(float)
-            .values
-        )
-
-        # ----------------------------------------------------
-        # 二分类标签
-        #
-        # Activity < 0.03  -> 0
-        # Activity >= 0.03 -> 1
-        # ----------------------------------------------------
-
-        self.labels = (
-            activity >= ACTIVITY_THRESHOLD
-        ).astype(np.float32)
-
-        # ----------------------------------------------------
-        # 特征
-        # ----------------------------------------------------
-
+        self.df = df.reset_index(drop=True)
         self.esm_embeds = esm_embeds
-
         self.mol_embeds = mol_embeds
 
-        # ----------------------------------------------------
-        # 浓度
-        # ----------------------------------------------------
-
-        if (
-            "SM_norm" not in self.df.columns
-            or
-            "Enz_norm" not in self.df.columns
-        ):
-
-            raise ValueError(
-                "DataFrame 必须包含 "
-                "'SM_norm' 和 'Enz_norm'"
-            )
-
-        self.sm_norm = (
-            self.df["SM_norm"]
-            .astype(float)
-            .values
-        )
-
-        self.enzyme_norm = (
-            self.df["Enz_norm"]
-            .astype(float)
-            .values
-        )
-
-        # ----------------------------------------------------
-        # 检查 ESM
-        # ----------------------------------------------------
-
-        missing_esm = [
-            x for x in self.idx
-            if x not in self.esm_embeds
-        ]
-
-        if len(missing_esm) > 0:
-
-            raise KeyError(
-                f"ESM.pkl 中缺少 "
-                f"{len(missing_esm)} 个 Name。"
-                f"例如：{missing_esm[:5]}"
-            )
-
-        # ----------------------------------------------------
-        # 检查 MolFormer
-        # ----------------------------------------------------
-
-        missing_mol = [
-            x for x in self.smiles
-            if x not in self.mol_embeds
-        ]
-
-        if len(missing_mol) > 0:
-
-            raise KeyError(
-                f"SM.pkl 中缺少 "
-                f"{len(missing_mol)} 个 SM。"
-                f"例如：{missing_mol[:5]}"
-            )
+        self.sm_mean = sm_mean
+        self.sm_std = sm_std
+        self.enz_mean = enz_mean
+        self.enz_std = enz_std
 
     def __len__(self):
-
         return len(self.df)
 
-    def __getitem__(self, i):
+    def __getitem__(self, idx):
 
-        # ====================================================
+        row = self.df.iloc[idx]
+
+        name = str(row["Name"])
+        sm = str(row["SM"])
+
+        # ----------------------------------------------------
         # ESM
-        # ====================================================
+        # ----------------------------------------------------
+        esm_data = self.esm_embeds[name]
 
-        idx = self.idx[i]
+        esm_emb = esm_data["emb"]
+        esm_mask = esm_data["mask"]
 
-        esm_data = (
-            self.esm_embeds[idx]
-        )
+        if not torch.is_tensor(esm_emb):
+            esm_emb = torch.tensor(esm_emb, dtype=torch.float32)
+        else:
+            esm_emb = esm_emb.float()
 
-        esm_emb = (
-            esm_data["emb"]
-            .float()
-        )
+        if not torch.is_tensor(esm_mask):
+            esm_mask = torch.tensor(esm_mask, dtype=torch.bool)
+        else:
+            esm_mask = esm_mask.bool()
 
-        esm_mask = (
-            esm_data["mask"]
-            .long()
-        )
-
-        # ====================================================
+        # ----------------------------------------------------
         # MolFormer
-        # ====================================================
+        # ----------------------------------------------------
+        mol_emb = self.mol_embeds[sm]
 
-        mol_feat = torch.as_tensor(
-            self.mol_embeds[
-                self.smiles[i]
-            ],
-            dtype=torch.float32
+        if not torch.is_tensor(mol_emb):
+            mol_emb = torch.tensor(mol_emb, dtype=torch.float32)
+        else:
+            mol_emb = mol_emb.float()
+
+        # ----------------------------------------------------
+        # substrate concentration
+        # ----------------------------------------------------
+        sm_loading = pd.to_numeric(
+            row["SM loading (g/L)"],
+            errors="coerce"
         )
 
-        # ====================================================
-        # Substrate concentration
-        # ====================================================
+        if pd.isna(sm_loading):
+            sm_loading = 0.0
 
-        sm_load = torch.tensor(
-            [self.sm_norm[i]],
-            dtype=torch.float32
+        sm_loading = max(float(sm_loading), 0.0)
+
+        # 与训练时保持一致
+        sm_loading = np.log1p(sm_loading)
+
+        sm_norm = (
+            sm_loading - self.sm_mean
+        ) / self.sm_std
+
+        # ----------------------------------------------------
+        # enzyme concentration
+        # ----------------------------------------------------
+        enz_loading = pd.to_numeric(
+            row["Enzyme loading (g/L)"],
+            errors="coerce"
         )
 
-        # ====================================================
-        # Enzyme concentration
-        # ====================================================
+        if pd.isna(enz_loading):
+            enz_loading = 0.0
 
-        enz_load = torch.tensor(
-            [self.enzyme_norm[i]],
-            dtype=torch.float32
-        )
+        enz_loading = max(float(enz_loading), 0.0)
 
-        # ====================================================
-        # Binary label
-        # ====================================================
+        # 与训练时保持一致
+        enz_loading = np.log1p(enz_loading)
 
-        label = torch.tensor(
-            self.labels[i],
-            dtype=torch.float32
-        )
+        enz_norm = (
+            enz_loading - self.enz_mean
+        ) / self.enz_std
 
         return (
             esm_emb,
             esm_mask,
-            mol_feat,
-            sm_load,
-            enz_load,
-            label
+            mol_emb,
+            torch.tensor(sm_norm, dtype=torch.float32),
+            torch.tensor(enz_norm, dtype=torch.float32),
+            name,
+            sm
         )
 
 
@@ -354,1738 +182,489 @@ class EnzymeSubstrateDataset(Dataset):
 
 class EnzymeSubstrateBinaryClassifier(nn.Module):
 
-    def __init__(self,esm_dim=1280,mol_dim=768,dropout=0.1,hidden_dim=256):
+    def __init__(self):
 
         super().__init__()
 
-        # ====================================================
-        # ESM projection
-        # ====================================================
-
-        self.esm_proj = nn.Sequential(
-
-            nn.Linear(esm_dim,512),
-
+        # ----------------------------------------------------
+        # ESM
+        # ----------------------------------------------------
+        self.esm_fc = nn.Sequential(
+            nn.Linear(1280, 512),
             nn.ReLU(),
-
-            nn.Dropout(dropout),
-
-            nn.Linear(512,256)
+            nn.Linear(512, 256),
+            nn.ReLU()
         )
 
-        # ====================================================
-        # MolFormer projection
-        # ====================================================
-
-        self.mol_proj = nn.Sequential(
-
-            nn.Linear(mol_dim,512),
-
-            nn.ReLU(),
-
-            nn.Dropout(dropout),
-
-            nn.Linear(512,256)
-        )
-
-        # ====================================================
+        # ----------------------------------------------------
         # Transformer
-        # ====================================================
-
-        encoder_layer = (
-            nn.TransformerEncoderLayer(
-                d_model=256,
-                nhead=8,
-                dim_feedforward=512,
-                dropout=dropout,
-                batch_first=True
-            )
+        # ----------------------------------------------------
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=256,
+            nhead=8,
+            dim_feedforward=512,
+            batch_first=True
         )
 
-        self.esm_encoder = (
-            nn.TransformerEncoder(
-                encoder_layer,
-                num_layers=2,
-                enable_nested_tensor=False
-            )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=2
         )
 
-        # ====================================================
-        # Substrate concentration
-        # ====================================================
-
-        self.sm_proj = nn.Sequential(
-
-            nn.Linear(1,64),
+        # ----------------------------------------------------
+        # MolFormer
+        # ----------------------------------------------------
+        self.mol_fc = nn.Sequential(
+            nn.Linear(768, 512),
             nn.ReLU(),
-            nn.Linear(64,128),
+            nn.Linear(512, 256),
+            nn.ReLU()
+        )
+
+        # ----------------------------------------------------
+        # substrate concentration
+        # ----------------------------------------------------
+        self.sm_fc = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
             nn.LayerNorm(128)
         )
 
-        # ====================================================
-        # Enzyme concentration
-        # ====================================================
-
-        self.enz_proj = nn.Sequential(
-
-            nn.Linear(1,64),
+        # ----------------------------------------------------
+        # enzyme concentration
+        # ----------------------------------------------------
+        self.enz_fc = nn.Sequential(
+            nn.Linear(1, 64),
             nn.ReLU(),
-            nn.Linear(64,128),
+            nn.Linear(64, 128),
+            nn.ReLU(),
             nn.LayerNorm(128)
         )
 
-        # ====================================================
-        # Fusion
-        # ====================================================
-
-        input_dim = (
-            256
-            + 256
-            + 128
-            + 128
+        # ----------------------------------------------------
+        # fusion
+        # 256 + 256 + 128 + 128 = 768
+        # ----------------------------------------------------
+        self.fc1 = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU()
         )
 
-        # ====================================================
-        # FC
-        # ====================================================
-
-        self.fc1 = nn.Linear(
-            input_dim,
-            hidden_dim
+        self.fc2 = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU()
         )
 
-        self.bn1 = nn.BatchNorm1d(
-            hidden_dim
+        self.fc3 = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU()
         )
 
-        self.fc2 = nn.Linear(
-            hidden_dim,
-            hidden_dim
-        )
+        self.dropout = nn.Dropout(0.2)
 
-        self.bn2 = nn.BatchNorm1d(
-            hidden_dim
-        )
-
-        self.fc3 = nn.Linear(
-            hidden_dim,
-            hidden_dim // 2
-        )
-
-        self.bn3 = nn.BatchNorm1d(
-            hidden_dim // 2
-        )
-
-        self.dropout = nn.Dropout(
-            0.2
-        )
-
-        # ====================================================
-        # 新的二分类头
-        #
-        # 输出 logits
-        #
-        # 不在这里 sigmoid
-        # ====================================================
-
-        self.classifier = nn.Linear(
-            hidden_dim // 2,
-            1
-        )
+        # 二分类输出
+        self.classifier = nn.Linear(128, 1)
 
     def forward(
         self,
-        esm_feat,
+        esm_emb,
         esm_mask,
-        mol_feat,
-        sm_load,
-        enz_load
+        mol_emb,
+        sm_norm,
+        enz_norm
     ):
 
-        # ====================================================
+        # ----------------------------------------------------
         # ESM
-        # ====================================================
+        # ----------------------------------------------------
+        x = self.esm_fc(esm_emb)
 
-        esm_feat = self.esm_proj(
-            esm_feat
+        # Transformer padding mask
+        # True = padding
+        src_key_padding_mask = ~esm_mask.bool()
+
+        x = self.transformer(
+            x,
+            src_key_padding_mask=src_key_padding_mask
         )
 
-        # ====================================================
-        # Transformer mask
-        # ====================================================
+        # mask mean pooling
+        mask = esm_mask.unsqueeze(-1).float()
 
-        src_mask = (
-            esm_mask == 0
-        ).bool()
+        x = x * mask
 
-        # ====================================================
-        # Transformer
-        # ====================================================
+        x = x.sum(dim=1) / mask.sum(
+            dim=1
+        ).clamp(min=1.0)
 
-        esm_feat = self.esm_encoder(
-            esm_feat,
-            src_key_padding_mask=src_mask
-        )
+        esm_feature = x
 
-        # ====================================================
-        # Masked mean pooling
-        # ====================================================
-
-        mask_expanded = (
-            esm_mask
-            .unsqueeze(-1)
-            .float()
-        )
-
-        denom = (
-            mask_expanded
-            .sum(dim=1)
-            .clamp(min=1e-8)
-        )
-
-        esm_pooled = (
-            esm_feat
-            * mask_expanded
-        ).sum(dim=1) / denom
-
-        # ====================================================
+        # ----------------------------------------------------
         # MolFormer
-        # ====================================================
+        # ----------------------------------------------------
+        mol_feature = self.mol_fc(mol_emb)
 
-        mol_proj = self.mol_proj(
-            mol_feat
+        # ----------------------------------------------------
+        # concentrations
+        # ----------------------------------------------------
+        sm_feature = self.sm_fc(
+            sm_norm.unsqueeze(1)
         )
 
-        # ====================================================
-        # Concentration
-        # ====================================================
-
-        sm_proj = self.sm_proj(
-            sm_load
+        enz_feature = self.enz_fc(
+            enz_norm.unsqueeze(1)
         )
 
-        enz_proj = self.enz_proj(
-            enz_load
-        )
-
-        # ====================================================
-        # Multimodal Fusion
-        # ====================================================
-
-        x = torch.cat(
+        # ----------------------------------------------------
+        # fusion
+        # ----------------------------------------------------
+        fusion = torch.cat(
             [
-                esm_pooled,
-                enz_proj,
-                mol_proj,
-                sm_proj
+                esm_feature,
+                mol_feature,
+                sm_feature,
+                enz_feature
             ],
-            dim=-1
+            dim=1
         )
 
-        # ====================================================
-        # FC1
-        # ====================================================
+        x = self.fc1(fusion)
 
-        x = F.relu(
-            self.bn1(
-                self.fc1(x)
-            )
-        )
-
-        # ====================================================
-        # Residual
-        # ====================================================
-
+        # residual
         residual = x
 
-        x = F.relu(
-            self.bn2(
-                self.fc2(x)
-            )
-        )
-
-        x = self.dropout(x)
+        x = self.fc2(x)
 
         x = x + residual
 
-        # ====================================================
-        # FC3
-        # ====================================================
+        x = self.fc3(x)
 
-        x = F.relu(
-            self.bn3(
-                self.fc3(x)
-            )
-        )
+        x = self.dropout(x)
 
-        # ====================================================
-        # Binary output
-        # ====================================================
+        # logits
+        logits = self.classifier(x)
 
-        logits = (
-            self.classifier(x)
-            .squeeze(-1)
-        )
-
-        return logits
+        return logits.squeeze(1)
 
 
 # ============================================================
-# 5. 加载原始回归模型
+# 5. 读取 scaler
 # ============================================================
 
-def load_pretrained(
-    model,
-    path,
-    device
-):
+print("\nLoading scaler...")
 
-    print(
-        "\n========== Loading pretrained model =========="
-    )
+with open(SCALER_PATH, "r") as f:
+    scaler = json.load(f)
 
-    ckpt = torch.load(
-        path,
-        map_location=device
-    )
+sm_mean = scaler["sm_mean"]
+sm_std = scaler["sm_std"]
 
-    # --------------------------------------------------------
-    # 如果 checkpoint 是：
-    #
-    # {"state_dict": ...}
-    # --------------------------------------------------------
+enz_mean = scaler["enz_mean"]
+enz_std = scaler["enz_std"]
 
-    if (
-        isinstance(ckpt, dict)
-        and
-        "state_dict" in ckpt
-    ):
-
-        ckpt = ckpt["state_dict"]
-
-    # --------------------------------------------------------
-    # 去掉 DataParallel 的 module.
-    # --------------------------------------------------------
-
-    new_ckpt = {}
-
-    for k, v in ckpt.items():
-
-        if k.startswith(
-            "module."
-        ):
-
-            k = k[7:]
-
-        new_ckpt[k] = v
-
-    ckpt = new_ckpt
-
-    # --------------------------------------------------------
-    # 原模型 fc4 是回归头
-    #
-    # 新模型 classifier 是二分类头
-    #
-    # 因此原 fc4 不加载
-    # --------------------------------------------------------
-
-    ckpt.pop(
-        "fc4.weight",
-        None
-    )
-
-    ckpt.pop(
-        "fc4.bias",
-        None
-    )
-
-    # --------------------------------------------------------
-    # 加载 backbone
-    # --------------------------------------------------------
-
-    missing, unexpected = (
-        model.load_state_dict(
-            ckpt,
-            strict=False
-        )
-    )
-
-    print(
-        "Missing keys:"
-    )
-
-    for x in missing:
-        print(
-            "  ",
-            x
-        )
-
-    print(
-        "Unexpected keys:"
-    )
-
-    for x in unexpected:
-        print(
-            "  ",
-            x
-        )
-
-    # --------------------------------------------------------
-    # 初始化新的 classifier
-    # --------------------------------------------------------
-
-    nn.init.xavier_uniform_(
-        model.classifier.weight
-    )
-
-    nn.init.zeros_(
-        model.classifier.bias
-    )
-
-    print(
-        "\n✅ 原模型 backbone 加载完成"
-    )
-
-    print(
-        "✅ 原 fc4 回归头未加载"
-    )
-
-    print(
-        "✅ 新 classifier 二分类头已初始化"
-    )
-
-    return model
+print("SM mean:", sm_mean)
+print("SM std :", sm_std)
+print("Enz mean:", enz_mean)
+print("Enz std :", enz_std)
 
 
 # ============================================================
-# 6. 训练一个 epoch
+# 6. 读取 ESM / MolFormer 特征
 # ============================================================
 
-def train_epoch(
-    model,
-    loader,
-    optimizer,
-    criterion,
-    device,
-    train_mode=True
-):
+print("\nLoading ESM embeddings...")
 
-    if train_mode:
+with open(ESM_PKL, "rb") as f:
+    esm_embeds = pickle.load(f)
 
-        model.train()
+print("ESM embeddings:", len(esm_embeds))
 
-    else:
 
-        # Stage 1：
-        # 冻结 backbone 时保持 BN / Dropout 状态
-        model.eval()
+print("\nLoading MolFormer embeddings...")
 
-    total_loss = 0.0
+with open(MOL_PKL, "rb") as f:
+    mol_embeds = pickle.load(f)
 
-    total_samples = 0
+print("MolFormer embeddings:", len(mol_embeds))
 
-    for (
-        esm_feat,
-        esm_mask,
-        mol_feat,
-        sm_load,
-        enz_load,
-        label
-    ) in loader:
 
-        # ----------------------------------------------------
-        # device
-        # ----------------------------------------------------
+# ============================================================
+# 7. 读取预测数据
+# ============================================================
 
-        esm_feat = esm_feat.to(
-            device,
-            non_blocking=True
+print("\nLoading input CSV...")
+
+df = pd.read_csv(INPUT_CSV)
+
+required_columns = [
+    "Name",
+    "SM",
+    "SM loading (g/L)",
+    "Enzyme loading (g/L)"
+]
+
+for col in required_columns:
+    if col not in df.columns:
+        raise ValueError(
+            f"Input CSV 缺少列: {col}"
         )
 
-        esm_mask = esm_mask.to(
-            device,
-            non_blocking=True
-        )
+print("Prediction samples:", len(df))
 
-        mol_feat = mol_feat.to(
-            device,
-            non_blocking=True
-        )
 
-        sm_load = sm_load.to(
-            device,
-            non_blocking=True
-        )
+# ============================================================
+# 8. 检查特征是否存在
+# ============================================================
 
-        enz_load = enz_load.to(
-            device,
-            non_blocking=True
-        )
+missing_esm = [
+    name for name in df["Name"].astype(str)
+    if name not in esm_embeds
+]
 
-        label = label.to(
-            device,
-            non_blocking=True
-        )
+missing_mol = [
+    sm for sm in df["SM"].astype(str)
+    if sm not in mol_embeds
+]
 
-        # ----------------------------------------------------
-        # forward
-        # ----------------------------------------------------
+if len(missing_esm) > 0:
+    print(
+        f"\nWARNING: {len(missing_esm)} 个 Name 没有 ESM 特征"
+    )
+    print("前10个:", missing_esm[:10])
+
+if len(missing_mol) > 0:
+    print(
+        f"\nWARNING: {len(missing_mol)} 个 SM 没有 MolFormer 特征"
+    )
+    print("前10个:", missing_mol[:10])
+
+
+# 只保留特征完整的数据
+valid_mask = (
+    df["Name"].astype(str).isin(esm_embeds.keys())
+    &
+    df["SM"].astype(str).isin(mol_embeds.keys())
+)
+
+df_valid = df[valid_mask].copy()
+
+df_valid = df_valid.reset_index(drop=True)
+
+print(
+    "\nValid samples:",
+    len(df_valid),
+    "/",
+    len(df)
+)
+
+
+# ============================================================
+# 9. Dataset / DataLoader
+# ============================================================
+
+dataset = ActivityPredictionDataset(
+    df_valid,
+    esm_embeds,
+    mol_embeds,
+    sm_mean,
+    sm_std,
+    enz_mean,
+    enz_std
+)
+
+loader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=0
+)
+
+
+# ============================================================
+# 10. 创建模型
+# ============================================================
+
+print("\nCreating model...")
+
+model = EnzymeSubstrateBinaryClassifier()
+
+checkpoint = torch.load(
+    MODEL_PATH,
+    map_location="cpu"
+)
+
+# 当前 best_model.pth 是纯 state_dict
+if isinstance(checkpoint, dict) and "model" in checkpoint:
+    print("检测到 checkpoint 格式：{'model': ...}")
+    state_dict = checkpoint["model"]
+else:
+    print("检测到 checkpoint 格式：纯 state_dict")
+    state_dict = checkpoint
+
+model.load_state_dict(
+    state_dict,
+    strict=True
+)
+
+model = model.to(DEVICE)
+
+model.eval()
+
+print("Model loaded successfully.")
+
+
+# ============================================================
+# 11. 预测
+# ============================================================
+
+all_probabilities = []
+
+print("\nStart prediction...")
+
+with torch.no_grad():
+
+    for batch in loader:
+
+        (
+            esm_emb,
+            esm_mask,
+            mol_emb,
+            sm_norm,
+            enz_norm,
+            names,
+            sms
+        ) = batch
+
+        esm_emb = esm_emb.to(DEVICE)
+        esm_mask = esm_mask.to(DEVICE)
+
+        mol_emb = mol_emb.to(DEVICE)
+
+        sm_norm = sm_norm.to(DEVICE)
+        enz_norm = enz_norm.to(DEVICE)
 
         logits = model(
-            esm_feat,
+            esm_emb,
             esm_mask,
-            mol_feat,
-            sm_load,
-            enz_load
+            mol_emb,
+            sm_norm,
+            enz_norm
         )
 
-        # ----------------------------------------------------
-        # BCE
-        # ----------------------------------------------------
+        probabilities = torch.sigmoid(logits)
 
-        loss = criterion(
-            logits,
-            label
+        all_probabilities.extend(
+            probabilities.cpu().numpy().tolist()
         )
 
-        # ----------------------------------------------------
-        # backward
-        # ----------------------------------------------------
 
-        optimizer.zero_grad(
-            set_to_none=True
-        )
-
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            5.0
-        )
-
-        optimizer.step()
-
-        batch_size = (
-            label.size(0)
-        )
-
-        total_loss += (
-            loss.item()
-            * batch_size
-        )
-
-        total_samples += (
-            batch_size
-        )
-
-    return (
-        total_loss
-        / total_samples
-    )
+all_probabilities = np.array(
+    all_probabilities
+)
 
 
 # ============================================================
-# 7. Prediction
+# 12. 二分类
 # ============================================================
 
-def predict(model,loader,device):
-
-    model.eval()
-
-    probabilities = []
-
-    labels = []
-
-    with torch.no_grad():
-
-        for (esm_feat,esm_mask,mol_feat,sm_load,enz_load,label) in loader:
-
-            esm_feat = esm_feat.to(device)
-
-            esm_mask = esm_mask.to(device)
-
-            mol_feat = mol_feat.to(device)
-
-            sm_load = sm_load.to(device)
-
-            enz_load = enz_load.to(device)
-
-            # ------------------------------------------------
-            # logits
-            # ------------------------------------------------
-
-            logits = model(esm_feat,esm_mask,mol_feat,sm_load,enz_load)
-
-            # ------------------------------------------------
-            # sigmoid
-            # ------------------------------------------------
-
-            prob = torch.sigmoid(logits)
-
-            probabilities.extend(prob.cpu().numpy())
-
-            labels.extend(label.numpy())
-
-    probabilities = np.asarray(probabilities)
-
-    labels = np.asarray(labels).astype(int)
-
-    predictions = (probabilities >= 0.5).astype(int)
-
-    return (labels,probabilities,predictions)  #固定0.5阈值
-    #return (labels,probabilities)
+pred_binary = (
+    all_probabilities >= PRED_THRESHOLD
+).astype(int)
 
 
 # ============================================================
-# 8. Evaluation
+# 13. 保存结果
 # ============================================================
 
-def evaluate(true,probabilities,predictions):
+result = df_valid.copy()
 
-    accuracy = accuracy_score(true,predictions)
+result["Pred_Active_Probability"] = all_probabilities
 
-    precision = precision_score(true,predictions,zero_division=0)
+result["Pred_Binary"] = pred_binary
 
-    recall = recall_score(true,predictions,zero_division=0)
+# 方便查看中文结果
+result["Pred_Result"] = np.where(
+    pred_binary == 1,
+    "有活性",
+    "无活性"
+)
 
-    f1 = f1_score(true,predictions,zero_division=0)
 
-    # --------------------------------------------------------
-    # AUC
-    # --------------------------------------------------------
+# 如果原始数据里面有 Activity，
+# 则同时计算真实标签
+if "Activity" in result.columns:
 
-    if len(np.unique(true)) == 2:
-
-        auc = roc_auc_score(true,probabilities)
-
-    else:
-
-        auc = np.nan
-
-    # --------------------------------------------------------
-    # confusion matrix
-    # --------------------------------------------------------
-
-    cm = confusion_matrix(true,predictions,labels=[0, 1])
-
-    return {
-
-        "Accuracy": accuracy,
-
-        "Precision": precision,
-
-        "Recall": recall,
-
-        "F1": f1,
-
-        "AUC": auc,
-
-        "TN": cm[0, 0],
-
-        "FP": cm[0, 1],
-
-        "FN": cm[1, 0],
-
-        "TP": cm[1, 1]
-    }
-
-
-# ============================================================
-# 9. 主程序
-# ============================================================
-
-def main():
-
-    # ========================================================
-    # seed
-    # ========================================================
-
-    set_seed(SEED)
-
-    # ========================================================
-    # device
-    # ========================================================
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    print(
-        "Using device:",
-        device
-    )
-
-    # ========================================================
-    # ESM
-    # ========================================================
-
-    print(
-        "\nLoading ESM features..."
-    )
-
-    with open(
-        ESM_PKL,
-        "rb"
-    ) as f:
-
-        esm_dict = pickle.load(
-            f
-        )
-
-    # ========================================================
-    # MolFormer
-    # ========================================================
-
-    print(
-        "Loading MolFormer features..."
-    )
-
-    with open(
-        MOL_PKL,
-        "rb"
-    ) as f:
-
-        mol_dict = pickle.load(
-            f
-        )
-
-    print(
-        f"ESM={len(esm_dict)}"
-    )
-
-    print(
-        f"MolFormer={len(mol_dict)}"
-    )
-
-    # ========================================================
-    # split
-    # ========================================================
-
-    def read_split(
-        filename
-    ):
-
-        path = os.path.join(
-            SPLIT_DIR,
-            filename
-        )
-
-        with open(
-            path
-        ) as f:
-
-            return [
-                x.strip()
-                for x in f
-                if x.strip()
-            ]
-
-    train_idx = set(
-        read_split(
-            TRAIN_TXT
-        )
-    )
-
-    val_idx = set(
-        read_split(
-            VAL_TXT
-        )
-    )
-
-    test_idx = set(
-        read_split(
-            TEST_TXT
-        )
-    )
-
-    print(
-        "\nSplit:"
-    )
-
-    print(
-        "Train:",
-        len(train_idx)
-    )
-
-    print(
-        "Val:",
-        len(val_idx)
-    )
-
-    print(
-        "Test:",
-        len(test_idx)
-    )
-
-    # ========================================================
-    # CSV
-    # ========================================================
-
-    print(
-        "\nLoading CSV..."
-    )
-
-    df = pd.read_csv(
-        CSV_PATH
-    )
-
-    # ========================================================
-    # 检查列
-    # ========================================================
-
-    required_columns = [
-        "idx",
-        "Name",
-        "SM",
-        "Activity",
-        "SM loading (g/L)",
-        "Enzyme loading (g/L)"
-    ]
-
-    missing_columns = [
-        x for x in required_columns
-        if x not in df.columns
-    ]
-
-    if missing_columns:
-
-        raise ValueError(
-            "CSV 缺少以下列："
-            + str(
-                missing_columns
-            )
-        )
-
-    # ========================================================
-    # ID
-    # ========================================================
-
-    df["idx"] = (
-        df["idx"]
-        .astype(str)
-    )
-
-    df["Name"] = (
-        df["Name"]
-        .astype(str)
-    )
-
-    # ========================================================
-    # Activity
-    # ========================================================
-
-    df["Activity"] = pd.to_numeric(
-        df["Activity"],
+    result["Activity"] = pd.to_numeric(
+        result["Activity"],
         errors="coerce"
     )
 
-    raw_size = len(df)
-
-    missing_activity = (
-        df["Activity"]
-        .isna()
-        .sum()
-    )
-
-    print(
-        "\nRaw data:",
-        raw_size
-    )
-
-    print(
-        "Activity NaN:",
-        missing_activity
-    )
-
-    # 删除 Activity 缺失
-    df = df.dropna(
-        subset=["Activity"]
-    ).reset_index(
-        drop=True
-    )
-
-    print(
-        "Valid data:",
-        len(df)
-    )
-
-    # ========================================================
-    # 根据 split 分数据
-    # ========================================================
-
-    df_train = (
-        df[
-            df["idx"]
-            .isin(train_idx)
-        ]
-        .copy()
-        .reset_index(drop=True)
-    )
-
-    df_val = (
-        df[
-            df["idx"]
-            .isin(val_idx)
-        ]
-        .copy()
-        .reset_index(drop=True)
-    )
-
-    df_test = (
-        df[
-            df["idx"]
-            .isin(test_idx)
-        ]
-        .copy()
-        .reset_index(drop=True)
-    )
-
-    print(
-        "\nDataset size:"
-    )
-
-    print(
-        "Train:",
-        len(df_train)
-    )
-
-    print(
-        "Val:",
-        len(df_val)
-    )
-
-    print(
-        "Test:",
-        len(df_test)
-    )
-
-    # ========================================================
-    # 检查二分类比例
-    # ========================================================
-
-    print(
-        "\n========== Binary distribution =========="
-    )
-
-    for name, d in [
-        ("Train", df_train),
-        ("Val", df_val),
-        ("Test", df_test)
-    ]:
-
-        y = (d["Activity"]>= ACTIVITY_THRESHOLD).astype(int)
-
-        n0 = (y == 0).sum()
-
-        n1 = (y == 1).sum()
-
-        print(f"{name}:")
-
-        print(
-            f"  0 = {n0} "
-            f"({n0 / len(y):.2%})"
-        )
-
-        print(
-            f"  1 = {n1} "
-            f"({n1 / len(y):.2%})"
-        )
-
-    # ========================================================
-    # 浓度
-    # ========================================================
-
-    SM_COL = (
-        "SM loading (g/L)"
-    )
-
-    ENZ_COL = (
-        "Enzyme loading (g/L)"
-    )
-
-    # ========================================================
-    # 原模型的浓度处理方式
-    # log1p
-    # ========================================================
-
-    for d in [
-        df_train,
-        df_val,
-        df_test
-    ]:
-
-        d[SM_COL] = pd.to_numeric(
-            d[SM_COL],
-            errors="coerce"
-        ).fillna(
-            0
-        ).clip(
-            lower=0
-        )
-
-        d[ENZ_COL] = pd.to_numeric(
-            d[ENZ_COL],
-            errors="coerce"
-        ).fillna(
-            0
-        ).clip(
-            lower=0
-        )
-
-        d["SM_log"] = np.log1p(
-            d[SM_COL]
-        )
-
-        d["Enz_log"] = np.log1p(
-            d[ENZ_COL]
-        )
-
-    # ========================================================
-    # 只用 train 计算 scaler
-    # ========================================================
-
-    sm_mean = (
-        df_train["SM_log"]
-        .mean()
-    )
-
-    sm_std = (
-        df_train["SM_log"]
-        .std()
-        + 1e-12
-    )
-
-    enz_mean = (
-        df_train["Enz_log"]
-        .mean()
-    )
-
-    enz_std = (
-        df_train["Enz_log"]
-        .std()
-        + 1e-12
-    )
-
-    # ========================================================
-    # z-score
-    # ========================================================
-
-    for d in [
-        df_train,
-        df_val,
-        df_test
-    ]:
-
-        d["SM_norm"] = (
-            d["SM_log"]
-            - sm_mean
-        ) / sm_std
-
-        d["Enz_norm"] = (
-            d["Enz_log"]
-            - enz_mean
-        ) / enz_std
-
-    # ========================================================
-    # 保存 scaler
-    #
-    # 二分类模型实际上不需要 Activity scaler
-    # 这里只保存浓度 scaler 和 threshold
-    # ========================================================
-
-    scaler = {
-
-        "sm_mean":
-            float(sm_mean),
-
-        "sm_std":
-            float(sm_std),
-
-        "enz_mean":
-            float(enz_mean),
-
-        "enz_std":
-            float(enz_std),
-
-        "activity_threshold":
-            float(ACTIVITY_THRESHOLD)
-    }
-
-    pd.Series(
-        scaler
-    ).to_json(
-        os.path.join(
-            MODEL_DIR,
-            "scaler.json"
-        )
-    )
-
-    # ========================================================
-    # Dataset
-    # ========================================================
-
-    train_set = (
-        EnzymeSubstrateDataset(
-            df_train,
-            esm_dict,
-            mol_dict
-        )
-    )
-
-    val_set = (
-        EnzymeSubstrateDataset(
-            df_val,
-            esm_dict,
-            mol_dict
-        )
-    )
-
-    test_set = (
-        EnzymeSubstrateDataset(
-            df_test,
-            esm_dict,
-            mol_dict
-        )
-    )
-
-    # ========================================================
-    # DataLoader
-    # ========================================================
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-
-    val_loader = DataLoader(
-        val_set,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True
-    )
-
-    test_loader = DataLoader(
-        test_set,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True
-    )
-
-    # ========================================================
-    # Model
-    # ========================================================
-
-    model = (
-        EnzymeSubstrateBinaryClassifier()
-        .to(device)
-    )
-
-    # ========================================================
-    # 加载原来的回归模型
-    # ========================================================
-
-    model = load_pretrained(
-        model,
-        PRETRAINED_MODEL,
-        device
-    )
-
-    # ========================================================
-    # 计算 pos_weight
-    # ========================================================
-
-    train_y = (df_train["Activity"]>= ACTIVITY_THRESHOLD).astype(int)
-
-    positive = (train_y == 1).sum()
-
-    negative = (train_y == 0).sum()
-
-    if positive == 0:
-
-        raise ValueError("训练集没有正样本。")
-
-    pos_weight_value = (negative / positive)
-
-    print("\n========== Class weight ==========")
-
-    print("Negative:",negative)
-
-    print("Positive:",positive)
-
-    print("pos_weight:",pos_weight_value)
-
-    criterion = (
-        nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor(
-                pos_weight_value,
-                dtype=torch.float32,
-                device=device
-            )
-        )
-    )
-
- 
-    # # ========================================================
-    # # Stage 1 (把“固定0.5阈值 + 固定学习率 + 固定500轮训练”改成了“自动找最佳阈值 + 自动降学习率 + 自动早停)
-    # # ========================================================
-
-    # print("\n========== Stage 1 ==========")
-
-    # for p in model.parameters():
-    #     p.requires_grad = False
-
-    # for p in model.classifier.parameters():
-    #     p.requires_grad = True
-
-    # optimizer = torch.optim.AdamW(
-    #     model.classifier.parameters(),
-    #     lr=STAGE1_LR,
-    #     weight_decay=WEIGHT_DECAY
-    # )
-
-    # best_f1 = -1
-
-    # stage1_path = os.path.join(
-    #     MODEL_DIR,
-    #     "stage1_best.pth"
-    # )
-
-    # for epoch in range(STAGE1_EPOCHS):
-
-    #     loss = train_epoch(
-    #         model,
-    #         train_loader,
-    #         optimizer,
-    #         criterion,
-    #         device,
-    #         train_mode=False
-    #     )
-
-    #     true_val, prob_val = predict(
-    #         model,
-    #         val_loader,
-    #         device
-    #     )
-
-    #     pred_val = (
-    #         prob_val >= 0.5
-    #     ).astype(int)
-
-    #     m = evaluate(
-    #         true_val,
-    #         prob_val,
-    #         pred_val
-    #     )
-
-    #     print(
-    #         f"Stage1 {epoch+1:03d}/{STAGE1_EPOCHS} | "
-    #         f"Loss={loss:.5f} | "
-    #         f"F1={m['F1']:.4f} | "
-    #         f"P={m['Precision']:.4f} | "
-    #         f"R={m['Recall']:.4f} | "
-    #         f"AUC={m['AUC']:.4f}"
-    #     )
-
-    #     if m["F1"] > best_f1:
-
-    #         best_f1 = m["F1"]
-
-    #         torch.save(
-    #             model.state_dict(),
-    #             stage1_path
-    #         )
-
-    # print(f"\nStage1 Best F1={best_f1:.4f}")
-
-    # model.load_state_dict(
-    #     torch.load(
-    #         stage1_path,
-    #         map_location=device
-    #     )
-    # )
-
-    # # ========================================================
-    # # Stage 2
-    # # ========================================================
-
-    # print("\n========== Stage 2 ==========")
-
-    # for p in model.parameters():
-    #     p.requires_grad = True
-
-    # optimizer = torch.optim.AdamW(
-    #     model.parameters(),
-    #     lr=STAGE2_LR,
-    #     weight_decay=WEIGHT_DECAY
-    # )
-
-    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    #     optimizer,
-    #     mode="max",
-    #     factor=0.5,
-    #     patience=15
-    # )
-
-    # best_f1 = -1
-    # best_threshold = 0.5
-
-    # patience = 30
-    # early_counter = 0
-
-    # best_path = os.path.join(
-    #     MODEL_DIR,
-    #     "best_model.pth"
-    # )
-
-    # for epoch in range(STAGE2_EPOCHS):
-
-    #     loss = train_epoch(
-    #         model,
-    #         train_loader,
-    #         optimizer,
-    #         criterion,
-    #         device,
-    #         train_mode=True
-    #     )
-
-    #     true_val, prob_val = predict(
-    #         model,
-    #         val_loader,
-    #         device
-    #     )
-
-    #     cur_threshold, _ = find_best_threshold(
-    #         true_val,
-    #         prob_val
-    #     )
-
-    #     pred_val = (
-    #         prob_val >= cur_threshold
-    #     ).astype(int)
-
-    #     m = evaluate(
-    #         true_val,
-    #         prob_val,
-    #         pred_val
-    #     )
-
-    #     scheduler.step(
-    #         m["F1"]
-    #     )
-
-    #     current_lr = optimizer.param_groups[0]["lr"]
-
-    #     print(
-    #         f"Stage2 {epoch+1:03d}/{STAGE2_EPOCHS} | "
-    #         f"Loss={loss:.5f} | "
-    #         f"F1={m['F1']:.4f} | "
-    #         f"P={m['Precision']:.4f} | "
-    #         f"R={m['Recall']:.4f} | "
-    #         f"AUC={m['AUC']:.4f} | "
-    #         f"TH={cur_threshold:.2f} | "
-    #         f"LR={current_lr:.2e}"
-    #     )
-
-    #     if m["F1"] > best_f1:
-
-    #         best_f1 = m["F1"]
-
-    #         best_threshold = cur_threshold
-
-    #         early_counter = 0
-
-    #         torch.save(
-    #             {
-    #                 "model": model.state_dict(),
-    #                 "threshold": best_threshold
-    #             },
-    #             best_path
-    #         )
-
-    #         print(
-    #             f">>> Best F1={best_f1:.4f} "
-    #             f"TH={best_threshold:.2f}"
-    #         )
-
-    #     else:
-
-    #         early_counter += 1
-
-    #     if early_counter >= patience:
-
-    #         print(
-    #             f"\nEarly Stopping "
-    #             f"at Epoch {epoch+1}"
-    #         )
-
-    #         break
-
-    # # ========================================================
-    # # FINAL TEST
-    # # ========================================================
-
-    # print("\n========== FINAL TEST ==========")
-
-    # ckpt = torch.load(
-    #     best_path,
-    #     map_location=device
-    # )
-
-    # model.load_state_dict(
-    #     ckpt["model"]
-    # )
-
-    # best_threshold = ckpt["threshold"]
-
-    # print(
-    #     f"Best Threshold = "
-    #     f"{best_threshold:.2f}"
-    # )
-
-    # true_test, prob_test = predict(
-    #     model,
-    #     test_loader,
-    #     device
-    # )
-
-    # pred_test = (
-    #     prob_test >= best_threshold
-    # ).astype(int)
-
-    # test_m = evaluate(
-    #     true_test,
-    #     prob_test,
-    #     pred_test
-    # )
-
-    # print("\n========== TEST RESULT ==========")
-
-    # for k, v in test_m.items():
-    #     print(f"{k}: {v}")
-
-    # # ========================================================
-    # # SAVE PREDICTION
-    # # ========================================================
-
-    # result = df_test.copy()
-
-    # result["True_Activity"] = result["Activity"]
-
-    # result["True_Binary"] = (
-    #     result["Activity"] >= ACTIVITY_THRESHOLD
-    # ).astype(int)
-
-    # result["Pred_Active_Probability"] = prob_test
-
-    # result["Pred_Binary"] = pred_test
-
-    # output_csv = os.path.join(
-    #     MODEL_DIR,
-    #     "test_predictions.csv"
-    # )
-
-    # result.to_csv(
-    #     output_csv,
-    #     index=False,
-    #     encoding="utf-8-sig"
-    # )
-
-    # print("\nPrediction saved:")
-    # print(output_csv)
-
-    
-
-
-    
-    # ========================================================
-    # Stage 1(固定0.5阈值 + 固定学习率 + 固定500轮训练)
-    #
-    # 只训练新的 classifier
-    # ========================================================
-
-    print(
-        "\n========== Stage 1 =========="
-    )
-
-    # 冻结全部
-    for p in model.parameters():
-
-        p.requires_grad = False
-
-    # 只解冻 classifier
-    for p in model.classifier.parameters():
-
-        p.requires_grad = True
-
-    optimizer = torch.optim.AdamW(
-        model.classifier.parameters(),
-        lr=STAGE1_LR,
-        weight_decay=WEIGHT_DECAY
-    )
-
-    best_f1 = -np.inf
-
-    stage1_path = os.path.join(
-        MODEL_DIR,
-        "stage1_best.pth"
-    )
-
-    for epoch in range(
-        STAGE1_EPOCHS
-    ):
-
-        loss = train_epoch(
-            model,
-            train_loader,
-            optimizer,
-            criterion,
-            device,
-            train_mode=False
-        )
-
-        (
-            true_val,
-            prob_val,
-            pred_val
-        ) = predict(
-            model,
-            val_loader,
-            device
-        )
-
-        m = evaluate(
-            true_val,
-            prob_val,
-            pred_val
-        )
-
-        print(
-            f"Stage1 "
-            f"{epoch + 1:03d}/"
-            f"{STAGE1_EPOCHS} | "
-            f"Loss={loss:.5f} | "
-            f"F1={m['F1']:.4f} | "
-            f"Precision={m['Precision']:.4f} | "
-            f"Recall={m['Recall']:.4f} | "
-            f"AUC={m['AUC']:.4f}"
-        )
-
-        # ----------------------------------------------------
-        # 保存 F1 最优
-        # ----------------------------------------------------
-
-        if m["F1"] > best_f1:
-
-            best_f1 = m["F1"]
-
-            torch.save(
-                model.state_dict(),
-                stage1_path
-            )
-
-    print("\nStage1 best F1:",best_f1)
-
-    # ========================================================
-    # 加载 Stage1 最优
-    # ========================================================
-
-    model.load_state_dict(
-        torch.load(
-            stage1_path,
-            map_location=device
-        )
-    )
-
-    # ========================================================
-    # Stage 2
-    #
-    # 全模型微调
-    # ========================================================
-
-    print(
-        "\n========== Stage 2 =========="
-    )
-
-    # 解冻全部
-    for p in model.parameters():
-
-        p.requires_grad = True
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=STAGE2_LR,
-        weight_decay=WEIGHT_DECAY
-    )
-
-    best_f1 = -np.inf
-
-    best_path = os.path.join(
-        MODEL_DIR,
-        "best_model.pth"
-    )
-
-    for epoch in range(STAGE2_EPOCHS):
-
-        loss = train_epoch(
-            model,
-            train_loader,
-            optimizer,
-            criterion,
-            device,
-            train_mode=True
-        )
-
-        (
-            true_val,
-            prob_val,
-            pred_val
-        ) = predict(
-            model,
-            val_loader,
-            device
-        )
-
-
-        m = evaluate(
-            true_val,
-            prob_val,
-            pred_val)
-
-        print(
-            f"Stage2 "
-            f"{epoch + 1:03d}/"
-            f"{STAGE2_EPOCHS} | "
-            f"Loss={loss:.5f} | "
-            f"F1={m['F1']:.4f} | "
-            f"Precision={m['Precision']:.4f} | "
-            f"Recall={m['Recall']:.4f} | "
-            f"AUC={m['AUC']:.4f}"
-        )
-
-        # ----------------------------------------------------
-        # F1 最优保存
-        # ----------------------------------------------------
-
-        if m["F1"] > best_f1:
-
-            best_f1 = m["F1"]
-
-            torch.save(
-                model.state_dict(),
-                best_path
-            )
-
-            print(
-                f"  >>> Best model "
-                f"F1={best_f1:.4f}"
-            )
-
-    # ========================================================
-    # Test
-    # ========================================================
-
-    print(
-        "\n========== FINAL TEST =========="
-    )
-
-    model.load_state_dict(
-        torch.load(
-            best_path,
-            map_location=device
-        )
-    )
-
-    (
-        true_test,
-        prob_test,
-        pred_test
-    ) = predict(
-        model,
-        test_loader,
-        device
-    )
-
-    test_m = evaluate(
-        true_test,
-        prob_test,
-        pred_test
-    )
-
-    # ========================================================
-    # 输出测试结果
-    # ========================================================
-
-    for k, v in test_m.items():
-
-        print(
-            f"{k}: {v}"
-        )
-
-    # ========================================================
-    # 保存测试预测
-    # ========================================================
-
-    result = (
-        df_test
-        .copy()
-    )
-
-    # 原始 Activity
-    result["True_Activity"] = (
-        result["Activity"]
-    )
-
-    # 根据 0.03 得到真实类别
     result["True_Binary"] = (
-        result["Activity"]
-        >= ACTIVITY_THRESHOLD
+        result["Activity"] >= 0.03
     ).astype(int)
 
-    # 模型输出概率
-    result[
-        "Pred_Active_Probability"
-    ] = prob_test
 
-    # 最终二分类
-    result[
-        "Pred_Binary"
-    ] = pred_test
-
-    # ========================================================
-    # 保存
-    # ========================================================
-
-    output_csv = os.path.join(
-        MODEL_DIR,
-        "test_predictions.csv"
-    )
-
-    result.to_csv(
-        output_csv,
-        index=False,
-        encoding="utf-8-sig"
-    )
-
-    print(
-        "\n预测结果已保存："
-    )
-
-    print(
-        output_csv
-    )
+result.to_csv(
+    OUTPUT_CSV,
+    index=False,
+    encoding="utf-8-sig"
+)
 
 
 # ============================================================
-# 10. Main
+# 14. 输出统计
 # ============================================================
 
-if __name__ == "__main__":
+print("\nPrediction finished.")
 
-    main()
+print("Output:", OUTPUT_CSV)
+
+print("\nPrediction statistics:")
+print(
+    "无活性(0):",
+    int((pred_binary == 0).sum())
+)
+
+print(
+    "有活性(1):",
+    int((pred_binary == 1).sum())
+)
+
+print(
+    "有活性比例:",
+    f"{pred_binary.mean():.4f}"
+)
+
+print(
+    "Probability min:",
+    all_probabilities.min()
+)
+
+print(
+    "Probability max:",
+    all_probabilities.max()
+)
+
+print(
+    "Probability mean:",
+    all_probabilities.mean()
+)
+
+print("\n前10条预测结果：")
+
+show_cols = [
+    "Name",
+    "SM",
+    "Pred_Active_Probability",
+    "Pred_Binary",
+    "Pred_Result"
+]
+
+print(
+    result[show_cols].head(10).to_string(index=False)
+)
