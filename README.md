@@ -1,3 +1,38 @@
+#                  ┌───────────────┐
+#                  │   ESM2        │
+#                  └───────┬───────┘
+#                          │
+#                          ↓
+#                  ┌───────────────┐
+#                  │ Transformer   │
+#                  └───────┬───────┘
+#                          │
+#                          │
+# MolFormer ───────────────┤
+#                          │
+# Enzyme concentration ───┤
+#                          │
+# Substrate concentration ┤
+#                          ↓
+#                 Multimodal Fusion
+#                          │
+#                          ↓
+#                   FC1 → FC2 → FC3
+#                          │
+#                          ↓
+#                   Binary Classifier
+#                          │
+#                          ↓
+#                     sigmoid
+#                          │
+#                          ↓
+#                  P(Active)
+#                   /          \
+#               < 0.5          ≥ 0.5
+#                 ↓              ↓
+#                 0              1
+#               无活性          有活性
+
 import os
 import random
 import numpy as np
@@ -18,79 +53,50 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+# ============================================================
+# 搜索最佳阈值
+# ============================================================
 
+def find_best_threshold(y_true, y_prob):
+    best_th, best_f1 = 0.5, -1
+
+    for th in np.arange(0.05, 0.96, 0.01):
+        pred = (y_prob >= th).astype(int)
+        f1 = f1_score(y_true, pred, zero_division=0)
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_th = th
+
+    return best_th, best_f1
 # ============================================================
 # 1. 参数
 # ============================================================
 
 SEED = 123
-
 BATCH_SIZE = 256
 
-# ============================================================
-# 原来已经训练好的回归模型
-# ============================================================
+# 原始训练好的模型
+PRETRAINED_MODEL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/enzyme_train/model/reg/model_resnet_krd_conc_S2_KRD_M_55%_add/best_model_add.pth"
 
-PRETRAINED_MODEL = (
-    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
-    "enzyme_train/model/reg/"
-    "model_resnet_krd_conc_S2_KRD_M_55%_add/"
-    "best_model_add.pth"
-)
-
-# ============================================================
 # 新 Activity 数据
-# ============================================================
+CSV_PATH = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/train_data3.csv"
 
-CSV_PATH = (
-    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
-    "微调/train_data3.csv"
-)
+# ESM / MolFormer
+ESM_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/esm_feats_emb_mask_test_6_0.pkl"
 
-# ============================================================
-# ESM 特征
-# ============================================================
+MOL_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/SM.pkl"
 
-ESM_PKL = (
-    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
-    "微调/esm_feats_emb_mask_test_6_0.pkl"
-)
-
-# ============================================================
-# MolFormer 特征
-# ============================================================
-
-MOL_PKL = (
-    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
-    "微调/SM.pkl"
-)
-
-# ============================================================
-# 数据划分
-# ============================================================
-
-SPLIT_DIR = (
-    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
-    "微调/splits_Activity"
-)
+# split
+SPLIT_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/splits_Activity"
 
 TRAIN_TXT = "train.txt"
 VAL_TXT = "val.txt"
 TEST_TXT = "test.txt"
 
-# ============================================================
-# 输出目录
-# ============================================================
-
-MODEL_DIR = (
-    "/data/caoying/softwares/酶R2/enzyme_交接20260609/"
-    "微调/model_Activity_binary"
-)
-
-os.makedirs(
-    MODEL_DIR,
-    exist_ok=True
-)
+# 输出
+MODEL_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/model_Activity_finetune_cls_2"
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ============================================================
 # Activity 二分类阈值
@@ -110,7 +116,7 @@ STAGE1_LR = 1e-3
 # ============================================================
 
 STAGE2_EPOCHS = 500
-STAGE2_LR = 3e-5
+STAGE2_LR = 5e-5  #3e-5
 
 WEIGHT_DECAY = 1e-5
 
@@ -346,17 +352,9 @@ class EnzymeSubstrateDataset(Dataset):
 # 4. 模型
 # ============================================================
 
-class EnzymeSubstrateBinaryClassifier(
-    nn.Module
-):
+class EnzymeSubstrateBinaryClassifier(nn.Module):
 
-    def __init__(
-        self,
-        esm_dim=1280,
-        mol_dim=768,
-        dropout=0.1,
-        hidden_dim=256
-    ):
+    def __init__(self,esm_dim=1280,mol_dim=768,dropout=0.1,hidden_dim=256):
 
         super().__init__()
 
@@ -366,21 +364,13 @@ class EnzymeSubstrateBinaryClassifier(
 
         self.esm_proj = nn.Sequential(
 
-            nn.Linear(
-                esm_dim,
-                512
-            ),
+            nn.Linear(esm_dim,512),
 
             nn.ReLU(),
 
-            nn.Dropout(
-                dropout
-            ),
+            nn.Dropout(dropout),
 
-            nn.Linear(
-                512,
-                256
-            )
+            nn.Linear(512,256)
         )
 
         # ====================================================
@@ -389,21 +379,13 @@ class EnzymeSubstrateBinaryClassifier(
 
         self.mol_proj = nn.Sequential(
 
-            nn.Linear(
-                mol_dim,
-                512
-            ),
+            nn.Linear(mol_dim,512),
 
             nn.ReLU(),
 
-            nn.Dropout(
-                dropout
-            ),
+            nn.Dropout(dropout),
 
-            nn.Linear(
-                512,
-                256
-            )
+            nn.Linear(512,256)
         )
 
         # ====================================================
@@ -434,21 +416,10 @@ class EnzymeSubstrateBinaryClassifier(
 
         self.sm_proj = nn.Sequential(
 
-            nn.Linear(
-                1,
-                64
-            ),
-
+            nn.Linear(1,64),
             nn.ReLU(),
-
-            nn.Linear(
-                64,
-                128
-            ),
-
-            nn.LayerNorm(
-                128
-            )
+            nn.Linear(64,128),
+            nn.LayerNorm(128)
         )
 
         # ====================================================
@@ -457,21 +428,10 @@ class EnzymeSubstrateBinaryClassifier(
 
         self.enz_proj = nn.Sequential(
 
-            nn.Linear(
-                1,
-                64
-            ),
-
+            nn.Linear(1,64),
             nn.ReLU(),
-
-            nn.Linear(
-                64,
-                128
-            ),
-
-            nn.LayerNorm(
-                128
-            )
+            nn.Linear(64,128),
+            nn.LayerNorm(128)
         )
 
         # ====================================================
@@ -928,11 +888,7 @@ def train_epoch(
 # 7. Prediction
 # ============================================================
 
-def predict(
-    model,
-    loader,
-    device
-):
+def predict(model,loader,device):
 
     model.eval()
 
@@ -942,127 +898,65 @@ def predict(
 
     with torch.no_grad():
 
-        for (
-            esm_feat,
-            esm_mask,
-            mol_feat,
-            sm_load,
-            enz_load,
-            label
-        ) in loader:
+        for (esm_feat,esm_mask,mol_feat,sm_load,enz_load,label) in loader:
 
-            esm_feat = esm_feat.to(
-                device
-            )
+            esm_feat = esm_feat.to(device)
 
-            esm_mask = esm_mask.to(
-                device
-            )
+            esm_mask = esm_mask.to(device)
 
-            mol_feat = mol_feat.to(
-                device
-            )
+            mol_feat = mol_feat.to(device)
 
-            sm_load = sm_load.to(
-                device
-            )
+            sm_load = sm_load.to(device)
 
-            enz_load = enz_load.to(
-                device
-            )
+            enz_load = enz_load.to(device)
 
             # ------------------------------------------------
             # logits
             # ------------------------------------------------
 
-            logits = model(
-                esm_feat,
-                esm_mask,
-                mol_feat,
-                sm_load,
-                enz_load
-            )
+            logits = model(esm_feat,esm_mask,mol_feat,sm_load,enz_load)
 
             # ------------------------------------------------
             # sigmoid
             # ------------------------------------------------
 
-            prob = torch.sigmoid(
-                logits
-            )
+            prob = torch.sigmoid(logits)
 
-            probabilities.extend(
-                prob.cpu().numpy()
-            )
+            probabilities.extend(prob.cpu().numpy())
 
-            labels.extend(
-                label.numpy()
-            )
+            labels.extend(label.numpy())
 
-    probabilities = np.asarray(
-        probabilities
-    )
+    probabilities = np.asarray(probabilities)
 
-    labels = np.asarray(
-        labels
-    ).astype(int)
+    labels = np.asarray(labels).astype(int)
 
-    predictions = (
-        probabilities >= 0.5
-    ).astype(int)
+    predictions = (probabilities >= 0.5).astype(int)
 
-    return (
-        labels,
-        probabilities,
-        predictions
-    )
+    #return (labels,probabilities,predictions)  #固定0.5阈值
+    return (labels,probabilities)
 
 
 # ============================================================
 # 8. Evaluation
 # ============================================================
 
-def evaluate(
-    true,
-    probabilities,
-    predictions
-):
+def evaluate(true,probabilities,predictions):
 
-    accuracy = accuracy_score(
-        true,
-        predictions
-    )
+    accuracy = accuracy_score(true,predictions)
 
-    precision = precision_score(
-        true,
-        predictions,
-        zero_division=0
-    )
+    precision = precision_score(true,predictions,zero_division=0)
 
-    recall = recall_score(
-        true,
-        predictions,
-        zero_division=0
-    )
+    recall = recall_score(true,predictions,zero_division=0)
 
-    f1 = f1_score(
-        true,
-        predictions,
-        zero_division=0
-    )
+    f1 = f1_score(true,predictions,zero_division=0)
 
     # --------------------------------------------------------
     # AUC
     # --------------------------------------------------------
 
-    if len(
-        np.unique(true)
-    ) == 2:
+    if len(np.unique(true)) == 2:
 
-        auc = roc_auc_score(
-            true,
-            probabilities
-        )
+        auc = roc_auc_score(true,probabilities)
 
     else:
 
@@ -1072,11 +966,7 @@ def evaluate(
     # confusion matrix
     # --------------------------------------------------------
 
-    cm = confusion_matrix(
-        true,
-        predictions,
-        labels=[0, 1]
-    )
+    cm = confusion_matrix(true,predictions,labels=[0, 1])
 
     return {
 
@@ -1110,9 +1000,7 @@ def main():
     # seed
     # ========================================================
 
-    set_seed(
-        SEED
-    )
+    set_seed(SEED)
 
     # ========================================================
     # device
@@ -1387,22 +1275,13 @@ def main():
         ("Test", df_test)
     ]:
 
-        y = (
-            d["Activity"]
-            >= ACTIVITY_THRESHOLD
-        ).astype(int)
+        y = (d["Activity"]>= ACTIVITY_THRESHOLD).astype(int)
 
-        n0 = (
-            y == 0
-        ).sum()
+        n0 = (y == 0).sum()
 
-        n1 = (
-            y == 1
-        ).sum()
+        n1 = (y == 1).sum()
 
-        print(
-            f"{name}:"
-        )
+        print(f"{name}:")
 
         print(
             f"  0 = {n0} "
@@ -1622,47 +1501,25 @@ def main():
     # 计算 pos_weight
     # ========================================================
 
-    train_y = (
-        df_train["Activity"]
-        >= ACTIVITY_THRESHOLD
-    ).astype(int)
+    train_y = (df_train["Activity"]>= ACTIVITY_THRESHOLD).astype(int)
 
-    positive = (
-        train_y == 1
-    ).sum()
+    positive = (train_y == 1).sum()
 
-    negative = (
-        train_y == 0
-    ).sum()
+    negative = (train_y == 0).sum()
 
     if positive == 0:
 
-        raise ValueError(
-            "训练集没有正样本。"
-        )
+        raise ValueError("训练集没有正样本。")
 
-    pos_weight_value = (
-        negative / positive
-    )
+    pos_weight_value = (negative / positive)
 
-    print(
-        "\n========== Class weight =========="
-    )
+    print("\n========== Class weight ==========")
 
-    print(
-        "Negative:",
-        negative
-    )
+    print("Negative:",negative)
 
-    print(
-        "Positive:",
-        positive
-    )
+    print("Positive:",positive)
 
-    print(
-        "pos_weight:",
-        pos_weight_value
-    )
+    print("pos_weight:",pos_weight_value)
 
     criterion = (
         nn.BCEWithLogitsLoss(
@@ -1674,24 +1531,17 @@ def main():
         )
     )
 
+ 
     # ========================================================
-    # Stage 1
-    #
-    # 只训练新的 classifier
+    # Stage 1 (把“固定0.5阈值 + 固定学习率 + 固定500轮训练”改成了“自动找最佳阈值 + 自动降学习率 + 自动早停)
     # ========================================================
 
-    print(
-        "\n========== Stage 1 =========="
-    )
+    print("\n========== Stage 1 ==========")
 
-    # 冻结全部
     for p in model.parameters():
-
         p.requires_grad = False
 
-    # 只解冻 classifier
     for p in model.classifier.parameters():
-
         p.requires_grad = True
 
     optimizer = torch.optim.AdamW(
@@ -1700,16 +1550,14 @@ def main():
         weight_decay=WEIGHT_DECAY
     )
 
-    best_f1 = -np.inf
+    best_f1 = -1
 
     stage1_path = os.path.join(
         MODEL_DIR,
         "stage1_best.pth"
     )
 
-    for epoch in range(
-        STAGE1_EPOCHS
-    ):
+    for epoch in range(STAGE1_EPOCHS):
 
         loss = train_epoch(
             model,
@@ -1720,15 +1568,15 @@ def main():
             train_mode=False
         )
 
-        (
-            true_val,
-            prob_val,
-            pred_val
-        ) = predict(
+        true_val, prob_val = predict(
             model,
             val_loader,
             device
         )
+
+        pred_val = (
+            prob_val >= 0.5
+        ).astype(int)
 
         m = evaluate(
             true_val,
@@ -1737,19 +1585,13 @@ def main():
         )
 
         print(
-            f"Stage1 "
-            f"{epoch + 1:03d}/"
-            f"{STAGE1_EPOCHS} | "
+            f"Stage1 {epoch+1:03d}/{STAGE1_EPOCHS} | "
             f"Loss={loss:.5f} | "
             f"F1={m['F1']:.4f} | "
-            f"Precision={m['Precision']:.4f} | "
-            f"Recall={m['Recall']:.4f} | "
+            f"P={m['Precision']:.4f} | "
+            f"R={m['Recall']:.4f} | "
             f"AUC={m['AUC']:.4f}"
         )
-
-        # ----------------------------------------------------
-        # 保存 F1 最优
-        # ----------------------------------------------------
 
         if m["F1"] > best_f1:
 
@@ -1760,14 +1602,7 @@ def main():
                 stage1_path
             )
 
-    print(
-        "\nStage1 best F1:",
-        best_f1
-    )
-
-    # ========================================================
-    # 加载 Stage1 最优
-    # ========================================================
+    print(f"\nStage1 Best F1={best_f1:.4f}")
 
     model.load_state_dict(
         torch.load(
@@ -1778,17 +1613,11 @@ def main():
 
     # ========================================================
     # Stage 2
-    #
-    # 全模型微调
     # ========================================================
 
-    print(
-        "\n========== Stage 2 =========="
-    )
+    print("\n========== Stage 2 ==========")
 
-    # 解冻全部
     for p in model.parameters():
-
         p.requires_grad = True
 
     optimizer = torch.optim.AdamW(
@@ -1797,16 +1626,25 @@ def main():
         weight_decay=WEIGHT_DECAY
     )
 
-    best_f1 = -np.inf
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=15
+    )
+
+    best_f1 = -1
+    best_threshold = 0.5
+
+    patience = 30
+    early_counter = 0
 
     best_path = os.path.join(
         MODEL_DIR,
         "best_model.pth"
     )
 
-    for epoch in range(
-        STAGE2_EPOCHS
-    ):
+    for epoch in range(STAGE2_EPOCHS):
 
         loss = train_epoch(
             model,
@@ -1817,15 +1655,20 @@ def main():
             train_mode=True
         )
 
-        (
-            true_val,
-            prob_val,
-            pred_val
-        ) = predict(
+        true_val, prob_val = predict(
             model,
             val_loader,
             device
         )
+
+        cur_threshold, _ = find_best_threshold(
+            true_val,
+            prob_val
+        )
+
+        pred_val = (
+            prob_val >= cur_threshold
+        ).astype(int)
 
         m = evaluate(
             true_val,
@@ -1833,59 +1676,88 @@ def main():
             pred_val
         )
 
-        print(
-            f"Stage2 "
-            f"{epoch + 1:03d}/"
-            f"{STAGE2_EPOCHS} | "
-            f"Loss={loss:.5f} | "
-            f"F1={m['F1']:.4f} | "
-            f"Precision={m['Precision']:.4f} | "
-            f"Recall={m['Recall']:.4f} | "
-            f"AUC={m['AUC']:.4f}"
+        scheduler.step(
+            m["F1"]
         )
 
-        # ----------------------------------------------------
-        # F1 最优保存
-        # ----------------------------------------------------
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        print(
+            f"Stage2 {epoch+1:03d}/{STAGE2_EPOCHS} | "
+            f"Loss={loss:.5f} | "
+            f"F1={m['F1']:.4f} | "
+            f"P={m['Precision']:.4f} | "
+            f"R={m['Recall']:.4f} | "
+            f"AUC={m['AUC']:.4f} | "
+            f"TH={cur_threshold:.2f} | "
+            f"LR={current_lr:.2e}"
+        )
 
         if m["F1"] > best_f1:
 
             best_f1 = m["F1"]
 
+            best_threshold = cur_threshold
+
+            early_counter = 0
+
             torch.save(
-                model.state_dict(),
+                {
+                    "model": model.state_dict(),
+                    "threshold": best_threshold
+                },
                 best_path
             )
 
             print(
-                f"  >>> Best model "
-                f"F1={best_f1:.4f}"
+                f">>> Best F1={best_f1:.4f} "
+                f"TH={best_threshold:.2f}"
             )
 
+        else:
+
+            early_counter += 1
+
+        if early_counter >= patience:
+
+            print(
+                f"\nEarly Stopping "
+                f"at Epoch {epoch+1}"
+            )
+
+            break
+
     # ========================================================
-    # Test
+    # FINAL TEST
     # ========================================================
 
-    print(
-        "\n========== FINAL TEST =========="
+    print("\n========== FINAL TEST ==========")
+
+    ckpt = torch.load(
+        best_path,
+        map_location=device
     )
 
     model.load_state_dict(
-        torch.load(
-            best_path,
-            map_location=device
-        )
+        ckpt["model"]
     )
 
-    (
-        true_test,
-        prob_test,
-        pred_test
-    ) = predict(
+    best_threshold = ckpt["threshold"]
+
+    print(
+        f"Best Threshold = "
+        f"{best_threshold:.2f}"
+    )
+
+    true_test, prob_test = predict(
         model,
         test_loader,
         device
     )
+
+    pred_test = (
+        prob_test >= best_threshold
+    ).astype(int)
 
     test_m = evaluate(
         true_test,
@@ -1893,49 +1765,26 @@ def main():
         pred_test
     )
 
-    # ========================================================
-    # 输出测试结果
-    # ========================================================
+    print("\n========== TEST RESULT ==========")
 
     for k, v in test_m.items():
-
-        print(
-            f"{k}: {v}"
-        )
+        print(f"{k}: {v}")
 
     # ========================================================
-    # 保存测试预测
+    # SAVE PREDICTION
     # ========================================================
 
-    result = (
-        df_test
-        .copy()
-    )
+    result = df_test.copy()
 
-    # 原始 Activity
-    result["True_Activity"] = (
-        result["Activity"]
-    )
+    result["True_Activity"] = result["Activity"]
 
-    # 根据 0.03 得到真实类别
     result["True_Binary"] = (
-        result["Activity"]
-        >= ACTIVITY_THRESHOLD
+        result["Activity"] >= ACTIVITY_THRESHOLD
     ).astype(int)
 
-    # 模型输出概率
-    result[
-        "Pred_Active_Probability"
-    ] = prob_test
+    result["Pred_Active_Probability"] = prob_test
 
-    # 最终二分类
-    result[
-        "Pred_Binary"
-    ] = pred_test
-
-    # ========================================================
-    # 保存
-    # ========================================================
+    result["Pred_Binary"] = pred_test
 
     output_csv = os.path.join(
         MODEL_DIR,
@@ -1948,13 +1797,289 @@ def main():
         encoding="utf-8-sig"
     )
 
-    print(
-        "\n预测结果已保存："
-    )
+    print("\nPrediction saved:")
+    print(output_csv)
 
-    print(
-        output_csv
-    )
+    
+
+
+    
+    # # ========================================================
+    # # Stage 1(固定0.5阈值 + 固定学习率 + 固定500轮训练)
+    # #
+    # # 只训练新的 classifier
+    # # ========================================================
+
+    # print(
+    #     "\n========== Stage 1 =========="
+    # )
+
+    # # 冻结全部
+    # for p in model.parameters():
+
+    #     p.requires_grad = False
+
+    # # 只解冻 classifier
+    # for p in model.classifier.parameters():
+
+    #     p.requires_grad = True
+
+    # optimizer = torch.optim.AdamW(
+    #     model.classifier.parameters(),
+    #     lr=STAGE1_LR,
+    #     weight_decay=WEIGHT_DECAY
+    # )
+
+    # best_f1 = -np.inf
+
+    # stage1_path = os.path.join(
+    #     MODEL_DIR,
+    #     "stage1_best.pth"
+    # )
+
+    # for epoch in range(
+    #     STAGE1_EPOCHS
+    # ):
+
+    #     loss = train_epoch(
+    #         model,
+    #         train_loader,
+    #         optimizer,
+    #         criterion,
+    #         device,
+    #         train_mode=False
+    #     )
+
+    #     (
+    #         true_val,
+    #         prob_val,
+    #         pred_val
+    #     ) = predict(
+    #         model,
+    #         val_loader,
+    #         device
+    #     )
+
+    #     m = evaluate(
+    #         true_val,
+    #         prob_val,
+    #         pred_val
+    #     )
+
+    #     print(
+    #         f"Stage1 "
+    #         f"{epoch + 1:03d}/"
+    #         f"{STAGE1_EPOCHS} | "
+    #         f"Loss={loss:.5f} | "
+    #         f"F1={m['F1']:.4f} | "
+    #         f"Precision={m['Precision']:.4f} | "
+    #         f"Recall={m['Recall']:.4f} | "
+    #         f"AUC={m['AUC']:.4f}"
+    #     )
+
+    #     # ----------------------------------------------------
+    #     # 保存 F1 最优
+    #     # ----------------------------------------------------
+
+    #     if m["F1"] > best_f1:
+
+    #         best_f1 = m["F1"]
+
+    #         torch.save(
+    #             model.state_dict(),
+    #             stage1_path
+    #         )
+
+    # print("\nStage1 best F1:",best_f1)
+
+    # # ========================================================
+    # # 加载 Stage1 最优
+    # # ========================================================
+
+    # model.load_state_dict(
+    #     torch.load(
+    #         stage1_path,
+    #         map_location=device
+    #     )
+    # )
+
+    # # ========================================================
+    # # Stage 2
+    # #
+    # # 全模型微调
+    # # ========================================================
+
+    # print(
+    #     "\n========== Stage 2 =========="
+    # )
+
+    # # 解冻全部
+    # for p in model.parameters():
+
+    #     p.requires_grad = True
+
+    # optimizer = torch.optim.AdamW(
+    #     model.parameters(),
+    #     lr=STAGE2_LR,
+    #     weight_decay=WEIGHT_DECAY
+    # )
+
+    # best_f1 = -np.inf
+
+    # best_path = os.path.join(
+    #     MODEL_DIR,
+    #     "best_model.pth"
+    # )
+
+    # for epoch in range(STAGE2_EPOCHS):
+
+    #     loss = train_epoch(
+    #         model,
+    #         train_loader,
+    #         optimizer,
+    #         criterion,
+    #         device,
+    #         train_mode=True
+    #     )
+
+    #     (
+    #         true_val,
+    #         prob_val,
+    #         pred_val
+    #     ) = predict(
+    #         model,
+    #         val_loader,
+    #         device
+    #     )
+
+
+    #     m = evaluate(
+    #         true_val,
+    #         prob_val,
+    #         pred_val)
+
+    #     print(
+    #         f"Stage2 "
+    #         f"{epoch + 1:03d}/"
+    #         f"{STAGE2_EPOCHS} | "
+    #         f"Loss={loss:.5f} | "
+    #         f"F1={m['F1']:.4f} | "
+    #         f"Precision={m['Precision']:.4f} | "
+    #         f"Recall={m['Recall']:.4f} | "
+    #         f"AUC={m['AUC']:.4f}"
+    #     )
+
+    #     # ----------------------------------------------------
+    #     # F1 最优保存
+    #     # ----------------------------------------------------
+
+    #     if m["F1"] > best_f1:
+
+    #         best_f1 = m["F1"]
+
+    #         torch.save(
+    #             model.state_dict(),
+    #             best_path
+    #         )
+
+    #         print(
+    #             f"  >>> Best model "
+    #             f"F1={best_f1:.4f}"
+    #         )
+
+    # # ========================================================
+    # # Test
+    # # ========================================================
+
+    # print(
+    #     "\n========== FINAL TEST =========="
+    # )
+
+    # model.load_state_dict(
+    #     torch.load(
+    #         best_path,
+    #         map_location=device
+    #     )
+    # )
+
+    # (
+    #     true_test,
+    #     prob_test,
+    #     pred_test
+    # ) = predict(
+    #     model,
+    #     test_loader,
+    #     device
+    # )
+
+    # test_m = evaluate(
+    #     true_test,
+    #     prob_test,
+    #     pred_test
+    # )
+
+    # # ========================================================
+    # # 输出测试结果
+    # # ========================================================
+
+    # for k, v in test_m.items():
+
+    #     print(
+    #         f"{k}: {v}"
+    #     )
+
+    # # ========================================================
+    # # 保存测试预测
+    # # ========================================================
+
+    # result = (
+    #     df_test
+    #     .copy()
+    # )
+
+    # # 原始 Activity
+    # result["True_Activity"] = (
+    #     result["Activity"]
+    # )
+
+    # # 根据 0.03 得到真实类别
+    # result["True_Binary"] = (
+    #     result["Activity"]
+    #     >= ACTIVITY_THRESHOLD
+    # ).astype(int)
+
+    # # 模型输出概率
+    # result[
+    #     "Pred_Active_Probability"
+    # ] = prob_test
+
+    # # 最终二分类
+    # result[
+    #     "Pred_Binary"
+    # ] = pred_test
+
+    # # ========================================================
+    # # 保存
+    # # ========================================================
+
+    # output_csv = os.path.join(
+    #     MODEL_DIR,
+    #     "test_predictions.csv"
+    # )
+
+    # result.to_csv(
+    #     output_csv,
+    #     index=False,
+    #     encoding="utf-8-sig"
+    # )
+
+    # print(
+    #     "\n预测结果已保存："
+    # )
+
+    # print(
+    #     output_csv
+    # )
 
 
 # ============================================================
