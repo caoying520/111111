@@ -112,3 +112,8 @@ if __name__ == "__main__":
     # 默认情况下 reverse=False, ascending=False (即从大到小排)
     # 如果设置了 --reverse, ascending=True (即从小到大排)
     split_by_sm_and_rank(args.input, args.smile, args.output, ascending=args.reverse)
+
+
+
+输出还是这个结果，只是不是新创建的excel，在原有excel中填入进去，填入对应sheet下，把predConv列内容放在这个excel下的R2 Predicted Value列，把rank列内容放到R2 Predicted Rank列
+完整代码，不用命令行格式
