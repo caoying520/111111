@@ -6,31 +6,31 @@ import os
 
 
 # ============================================================
-# 1. 路径
+# 1. 路径设置
 # ============================================================
 
 # 预测结果 CSV
 PRED_CSV = "/data/caoying/softwares/酶R2/prediction.csv"
 
-# 原始 Excel
+# 原始 Excel 模板
 INPUT_EXCEL = "/data/caoying/softwares/酶R2/original.xlsx"
 
 # 输出 Excel
 OUTPUT_EXCEL = "/data/caoying/softwares/酶R2/original_R2.xlsx"
 
-# ------------------------------------------------------------
-# Excel 的 Sheet 名是否就是 SM？
+# ============================================================
+# Excel Sheet 与 SM 的关系
 #
 # True：
-#     Sheet 名 = SM
+#     Excel Sheet 名 = SM
 #
 # False：
-#     Sheet 名 = SMILE.csv 中的 Name
-#     此时需要填写 SMILE_CSV
-# ------------------------------------------------------------
+#     Excel Sheet 名 = SMILE.csv 中的 Name
+# ============================================================
 
 SHEET_IS_SM = True
 
+# 如果 SHEET_IS_SM = False 才需要
 SMILE_CSV = "/data/caoying/softwares/酶R2/SMILE.csv"
 
 
@@ -38,17 +38,23 @@ SMILE_CSV = "/data/caoying/softwares/酶R2/SMILE.csv"
 # 2. 参数
 # ============================================================
 
-# pred_Conv 越大排名越靠前
-# 与你之前代码默认行为一致
+# False = pred_Conv 从大到小
+# True  = pred_Conv 从小到大
 SORT_ASCENDING = False
 
-# Excel 中要写入的列
+# ============================================================
+# Excel 模板中的实际列名
+# ============================================================
+
+EXCEL_ID_COL = "Biortus No."
+
 EXCEL_VALUE_COL = "R2 Predicted Value"
+
 EXCEL_RANK_COL = "R2 Predicted Rank"
 
 
 # ============================================================
-# 3. 清洗字符串
+# 3. 字符串清洗
 # ============================================================
 
 def clean_value(x):
@@ -60,12 +66,12 @@ def clean_value(x):
 
 
 # ============================================================
-# 4. 读取预测 CSV
+# 4. 读取预测结果
 # ============================================================
 
-print("=" * 60)
+print("=" * 70)
 print("读取预测结果")
-print("=" * 60)
+print("=" * 70)
 
 if not os.path.exists(PRED_CSV):
     raise FileNotFoundError(
@@ -74,12 +80,13 @@ if not os.path.exists(PRED_CSV):
 
 df = pd.read_csv(PRED_CSV)
 
-print(f"预测结果数量：{len(df)}")
-print(f"CSV 列：{list(df.columns)}")
+print(f"预测数据数量：{len(df)}")
+print("CSV 列：")
+print(list(df.columns))
 
 
 # ============================================================
-# 5. 检查必要列
+# 5. 检查预测 CSV 必要列
 # ============================================================
 
 required_cols = [
@@ -93,8 +100,8 @@ for col in required_cols:
     if col not in df.columns:
 
         raise ValueError(
-            f"预测 CSV 缺少必要列：{col}\n"
-            f"当前列：{list(df.columns)}"
+            f"\n预测 CSV 缺少必要列：{col}\n"
+            f"当前 CSV 列：{list(df.columns)}"
         )
 
 
@@ -102,30 +109,22 @@ for col in required_cols:
 # 6. 清洗 Name / SM
 # ============================================================
 
-df["Name_match"] = df["Name"].apply(clean_value)
-df["SM_match"] = df["SM"].apply(clean_value)
+df["Name_match"] = (
+    df["Name"].apply(clean_value)
+)
+
+df["SM_match"] = (
+    df["SM"].apply(clean_value)
+)
 
 
 # ============================================================
-# 7. 按 SM 分组，并重新计算 rank
+# 7. 按 SM 分组计算 rank
 # ============================================================
 
-print("\n正在按照 SM 计算 rank...")
-
-# ------------------------------------------------------------
-# 这里就是你之前代码中的核心逻辑
-#
-# 每一个 SM 单独排名：
-#
-# pred_Conv 最大 → rank 1
-# 第二大       → rank 2
-# 第三大       → rank 3
-# ...
-#
-# 如果 SORT_ASCENDING=True：
-#
-# pred_Conv 最小 → rank 1
-# ------------------------------------------------------------
+print("\n" + "=" * 70)
+print("按照 SM 分组计算 rank")
+print("=" * 70)
 
 ranked_groups = []
 
@@ -134,14 +133,17 @@ for sm_value, group in df.groupby(
     sort=False
 ):
 
+    # --------------------------------------------------------
     # 按 pred_Conv 排序
+    # --------------------------------------------------------
+
     sorted_group = group.sort_values(
         by="pred_Conv",
         ascending=SORT_ASCENDING
     ).reset_index(drop=True)
 
     # --------------------------------------------------------
-    # 重新生成 rank
+    # 生成 rank
     # --------------------------------------------------------
 
     sorted_group["rank"] = (
@@ -153,23 +155,23 @@ for sm_value, group in df.groupby(
     )
 
 
-# 合并
+# 合并所有 SM
 ranked_df = pd.concat(
     ranked_groups,
     ignore_index=True
 )
 
 print(
-    f"共 {ranked_df['SM_match'].nunique()} 个不同 SM"
+    f"SM 数量：{ranked_df['SM_match'].nunique()}"
 )
 
 print(
-    f"共生成 {len(ranked_df)} 条排名结果"
+    f"总预测数量：{len(ranked_df)}"
 )
 
 
 # ============================================================
-# 8. 检查 rank 是否生成成功
+# 8. 显示 rank 示例
 # ============================================================
 
 print("\nRank 示例：")
@@ -187,14 +189,8 @@ print(
 
 
 # ============================================================
-# 9. 建立预测结果字典
+# 9. 建立 Name + SM → prediction 映射
 # ============================================================
-
-# 使用：
-#
-# Name + SM
-#
-# 作为唯一匹配条件
 
 prediction_dict = {}
 
@@ -212,7 +208,7 @@ for _, row in ranked_df.iterrows():
 
 
 print(
-    f"\n建立预测映射：{len(prediction_dict)} 条"
+    f"\n预测映射数量：{len(prediction_dict)}"
 )
 
 
@@ -263,7 +259,7 @@ if not SHEET_IS_SM:
 
 
 # ============================================================
-# 11. 打开原 Excel
+# 11. 打开 Excel
 # ============================================================
 
 if not os.path.exists(INPUT_EXCEL):
@@ -272,15 +268,27 @@ if not os.path.exists(INPUT_EXCEL):
         f"找不到 Excel：\n{INPUT_EXCEL}"
     )
 
-print("\n正在打开 Excel...")
+print("\n" + "=" * 70)
+print("打开 Excel 模板")
+print("=" * 70)
 
 wb = openpyxl.load_workbook(
     INPUT_EXCEL
 )
 
 print(
-    f"Excel 中共有 {len(wb.sheetnames)} 个 Sheet"
+    f"Sheet 数量：{len(wb.sheetnames)}"
 )
+
+print(
+    "Sheet 名称："
+)
+
+for sheet_name in wb.sheetnames:
+
+    print(
+        f"  {sheet_name}"
+    )
 
 
 # ============================================================
@@ -288,24 +296,28 @@ print(
 # ============================================================
 
 total_updated = 0
+
 total_not_found = 0
+
+total_sheet_not_found = 0
 
 
 # ============================================================
-# 13. 遍历 Excel Sheet
+# 13. 遍历 Sheet
 # ============================================================
 
 for sheet_name in wb.sheetnames:
 
     ws = wb[sheet_name]
 
-    print("\n" + "-" * 60)
+    print("\n" + "-" * 70)
     print(f"处理 Sheet：{sheet_name}")
-    print("-" * 60)
+    print("-" * 70)
 
-    # --------------------------------------------------------
-    # 确定这个 Sheet 对应哪个 SM
-    # --------------------------------------------------------
+
+    # ========================================================
+    # 确定当前 Sheet 对应的 SM
+    # ========================================================
 
     if SHEET_IS_SM:
 
@@ -331,21 +343,29 @@ for sheet_name in wb.sheetnames:
         if sheet_sm is None:
 
             print(
-                "[WARNING] 无法找到该 Sheet 对应的 SM"
+                "[WARNING] "
+                "无法找到该 Sheet 对应的 SM"
             )
+
+            total_sheet_not_found += 1
 
             continue
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # 查找表头
-    # --------------------------------------------------------
+    # ========================================================
 
     header_row = None
-    name_col = None
+
+    biortus_col = None
+
     value_col = None
+
     rank_col = None
 
-    # 搜索前 30 行
+
+    # 在前 30 行寻找表头
     for row in ws.iter_rows(
         min_row=1,
         max_row=min(ws.max_row, 30)
@@ -356,43 +376,68 @@ for sheet_name in wb.sheetnames:
             if cell.value is None:
                 continue
 
-            value = str(
+            cell_value = str(
                 cell.value
             ).strip()
 
-            if value == "Name":
+
+            # ------------------------------------------------
+            # 找 Biortus No.
+            # ------------------------------------------------
+
+            if cell_value == EXCEL_ID_COL:
 
                 header_row = cell.row
-                name_col = cell.column
 
-            elif value == EXCEL_VALUE_COL:
+                biortus_col = cell.column
+
+
+            # ------------------------------------------------
+            # 找 R2 Predicted Value
+            # ------------------------------------------------
+
+            if cell_value == EXCEL_VALUE_COL:
 
                 header_row = cell.row
+
                 value_col = cell.column
 
-            elif value == EXCEL_RANK_COL:
+
+            # ------------------------------------------------
+            # 找 R2 Predicted Rank
+            # ------------------------------------------------
+
+            if cell_value == EXCEL_RANK_COL:
 
                 header_row = cell.row
+
                 rank_col = cell.column
 
 
-    # --------------------------------------------------------
-    # 没有 Name
-    # --------------------------------------------------------
+    # ========================================================
+    # 检查 Biortus No.
+    # ========================================================
 
-    if name_col is None:
+    if biortus_col is None:
 
         print(
-            "[WARNING] 没有找到 Name 列"
+            f"[WARNING] Sheet '{sheet_name}' "
+            f"没有找到 '{EXCEL_ID_COL}' 列"
         )
 
         continue
 
 
-    # --------------------------------------------------------
+    print(
+        f"找到 {EXCEL_ID_COL}："
+        f"第 {biortus_col} 列"
+    )
+
+
+    # ========================================================
     # 如果没有 R2 Predicted Value
     # 自动创建
-    # --------------------------------------------------------
+    # ========================================================
 
     if value_col is None:
 
@@ -408,16 +453,16 @@ for sheet_name in wb.sheetnames:
         )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # 如果没有 R2 Predicted Rank
     # 自动创建
-    # --------------------------------------------------------
+    # ========================================================
 
     if rank_col is None:
 
         rank_col = ws.max_column + 1
 
-        # 防止两个新列发生位置冲突
+        # 防止与 value_col 重叠
         if rank_col == value_col:
 
             rank_col += 1
@@ -432,51 +477,76 @@ for sheet_name in wb.sheetnames:
         )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # 开始填充
-    # --------------------------------------------------------
+    # ========================================================
 
     sheet_updated = 0
+
     sheet_not_found = 0
+
 
     for row_idx in range(
         header_row + 1,
         ws.max_row + 1
     ):
 
-        name = clean_value(
-            ws.cell(
-                row=row_idx,
-                column=name_col
-            ).value
+
+        # ----------------------------------------------------
+        # 读取 Biortus No.
+        # ----------------------------------------------------
+
+        biortus_no = ws.cell(
+            row=row_idx,
+            column=biortus_col
+        ).value
+
+        biortus_no = clean_value(
+            biortus_no
         )
 
-        if name == "":
+
+        if biortus_no == "":
             continue
 
-        # ----------------------------------------------------
-        # Name + SM
-        # ----------------------------------------------------
+
+        # ====================================================
+        # 关键匹配：
+        #
+        # Excel：
+        #     Biortus No.
+        #
+        # CSV：
+        #     Name
+        #
+        # 同时：
+        #     Excel Sheet → SM
+        #
+        # ====================================================
 
         key = (
-            name,
+            biortus_no,
             sheet_sm
         )
 
+
         # ----------------------------------------------------
-        # 查找预测
+        # 查找预测结果
         # ----------------------------------------------------
 
         if key not in prediction_dict:
 
             sheet_not_found += 1
+
             total_not_found += 1
 
             continue
 
+
         prediction = (
             prediction_dict[key]
         )
+
 
         pred_value = prediction[
             "pred_Conv"
@@ -487,14 +557,15 @@ for sheet_name in wb.sheetnames:
         ]
 
 
-        # ----------------------------------------------------
-        # 写 R2 Predicted Value
-        # ----------------------------------------------------
+        # ====================================================
+        # 写入 R2 Predicted Value
+        # ====================================================
 
         value_cell = ws.cell(
             row=row_idx,
             column=value_col
         )
+
 
         if pd.isna(pred_value):
 
@@ -508,14 +579,15 @@ for sheet_name in wb.sheetnames:
             )
 
 
-        # ----------------------------------------------------
-        # 写 R2 Predicted Rank
-        # ----------------------------------------------------
+        # ====================================================
+        # 写入 R2 Predicted Rank
+        # ====================================================
 
         rank_cell = ws.cell(
             row=row_idx,
             column=rank_col
         )
+
 
         if pd.isna(pred_rank):
 
@@ -529,15 +601,20 @@ for sheet_name in wb.sheetnames:
 
 
         sheet_updated += 1
+
         total_updated += 1
 
+
+    # ========================================================
+    # 当前 Sheet 统计
+    # ========================================================
 
     print(
         f"成功填入：{sheet_updated}"
     )
 
     print(
-        f"没有匹配到：{sheet_not_found}"
+        f"未找到匹配：{sheet_not_found}"
     )
 
 
@@ -545,9 +622,10 @@ for sheet_name in wb.sheetnames:
 # 14. 保存
 # ============================================================
 
-print("\n" + "=" * 60)
+print("\n" + "=" * 70)
 print("保存 Excel")
-print("=" * 60)
+print("=" * 70)
+
 
 output_dir = os.path.dirname(
     OUTPUT_EXCEL
@@ -560,6 +638,7 @@ if output_dir:
         exist_ok=True
     )
 
+
 wb.save(
     OUTPUT_EXCEL
 )
@@ -569,24 +648,28 @@ wb.save(
 # 15. 最终统计
 # ============================================================
 
-print("\n" + "=" * 60)
-print("处理完成！")
-print("=" * 60)
+print("\n" + "=" * 70)
+print("处理完成")
+print("=" * 70)
 
 print(
-    f"输入 Excel：{INPUT_EXCEL}"
+    f"输入 Excel：\n{INPUT_EXCEL}"
 )
 
 print(
-    f"输出 Excel：{OUTPUT_EXCEL}"
+    f"\n输出 Excel：\n{OUTPUT_EXCEL}"
 )
 
 print(
-    f"总填入数量：{total_updated}"
+    f"\n成功填入：{total_updated}"
 )
 
 print(
-    f"未匹配数量：{total_not_found}"
+    f"未匹配：{total_not_found}"
 )
 
-print("=" * 60)
+print(
+    f"找不到对应 Sheet：{total_sheet_not_found}"
+)
+
+print("=" * 70)
