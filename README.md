@@ -1,3 +1,24 @@
+ESM2
+ ↓
+Transformer ─────────┐
+                     │
+MolFormer ───────────┤
+                     │
+Enzyme concentration ┤
+                     │
+Substrate concentration
+                     ↓
+              Multimodal Fusion
+                     ↓
+               FC1 → FC2 → FC3
+                     ↓
+              Linear(..., 3)
+                     ↓
+                  Softmax
+              ↙      ↓      ↘
+            P(0)    P(1)    P(2)
+             ↓       ↓       ↓
+           <0.1   0.1~<1     ≥1
 import os
 import random
 import json
