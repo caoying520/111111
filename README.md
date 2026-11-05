@@ -1,467 +1,371 @@
-ESM2
- ↓
-Transformer ─────────┐
-                     │
-MolFormer ───────────┤
-                     │
-Enzyme concentration ┤
-                     │
-Substrate concentration
-                     ↓
-              Multimodal Fusion
-                     ↓
-               FC1 → FC2 → FC3
-                     ↓
-              Linear(..., 3)
-                     ↓
-                  Softmax
-              ↙      ↓      ↘
-            P(0)    P(1)    P(2)
-             ↓       ↓       ↓
-           <0.1   0.1~<1     ≥1
 import os
-import random
-import json
+import argparse
 import numpy as np
 import pandas as pd
-from copy import deepcopy
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    matthews_corrcoef, roc_auc_score, average_precision_score
+)
 
-# =========================================================
-# 1. 参数
-# =========================================================
-SEED=123
-BATCH_SIZE=256
-NUM_CLASSES=3
-ACTIVITY_THRESHOLD_1=0.1
-ACTIVITY_THRESHOLD_2=1.0
-STAGE1_EPOCHS=50
-STAGE1_LR=1e-3
-STAGE2_EPOCHS=500
-STAGE2_LR=3e-5
-WEIGHT_DECAY=1e-5
-REDUCE_FACTOR=0.5
-REDUCE_PATIENCE=15
-EARLY_STOP_PATIENCE=30
+from Model import ProtSATT
 
-DATA_PATH="/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/train_data3.csv"
-ESM_PATH="/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/esm_feats_emb_mask_test_6_0.pkl"
-MOL_PATH="/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/SM.pkl"
-SPLIT_DIR="/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/splits_Activity_high"
-PRETRAINED_PATH="/data/caoying/softwares/酶R2/enzyme_交接20260609/enzyme_train/model/reg/model_resnet_krd_conc_S2_KRD_M_55%_add/best_model_add.pth"
-OUTPUT_DIR="/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/model_Activity_finetune_3cls"
-os.makedirs(OUTPUT_DIR,exist_ok=True)
+def parse_args():
+    parser = argparse.ArgumentParser(description="ProtSATT")
+    parser.add_argument('--num_classes', type=int, default=3, choices=[2, 3])
+    parser.add_argument('--sim_threshold', type=str, default='Sim_40')
+    parser.add_argument('--scheduler', type=str, default='LambdaLR') # ReduceLROnPlateau LambdaLR
+    parser.add_argument('--epochs', type=int, default=1500)
+    parser.add_argument('--warmup', type=int, default=150) # LambdaLR，按 epoch 计
+    parser.add_argument('--patience', type=int, default=150)
+    parser.add_argument('--lr_patience', type=int, default=20) # 5 ReduceLROnPlateau
+    parser.add_argument('--lr_factor', type=float, default=0.5) # 0.5 ReduceLROnPlateau
+    parser.add_argument('--min_lr', type=float, default=1e-4) # 1e-6 ReduceLROnPlateau
+    parser.add_argument('--batch_size', type=int, default=2048)
+    parser.add_argument('--lr', type=float, default=1e-2) # 1e-3
+    parser.add_argument('--weight_decay', type=float, default=0.05)
+    parser.add_argument('--seed', type=int, default=2025) # 42
+    parser.add_argument('--data_dir', type=str, default=r'/data/caoying/softwares/ProtSATT/new_train/Expression/feature_train')
+    parser.add_argument('--save_dir', type=str, default=r'/data/caoying/softwares/ProtSATT/new_train/Expression/result/3_lables_experiment_train3/checkpoints_3labels_lr1e-2_LambdaLR_monitorACC')
 
-def set_seed(seed=123):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic=True; torch.backends.cudnn.benchmark=False
+    parser.add_argument('--dropout', type=float, default=0.25)
 
-set_seed(SEED)
-device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:",device)
+    parser.add_argument('--first_self_query_dim', type=int, default=32)
+    parser.add_argument('--first_self_return_dim', type=int, default=512)
+    parser.add_argument('--first_self_num_head', type=int, default=1)
+    parser.add_argument('--first_self_dropout', type=float, default=0.25)
+    parser.add_argument('--first_self_residual_coef', type=float, default=0)
 
-# =========================================================
-# 2. 三分类标签
-# =========================================================
-def activity_to_class(activity):
-    activity=np.asarray(activity,dtype=float)
-    return np.where(activity<ACTIVITY_THRESHOLD_1,0,np.where(activity<ACTIVITY_THRESHOLD_2,1,2)).astype(np.int64)
+    parser.add_argument('--self_deep', type=int, default=1)
+    parser.add_argument('--deep_self_query_dim', type=int, default=16)
+    parser.add_argument('--deep_self_return_dim', type=int, default=128)
+    parser.add_argument('--deep_self_num_head', type=int, default=1)
+    parser.add_argument('--deep_self_dropout', type=float, default=0.25)
+    parser.add_argument('--deep_self_residual_coef', type=float, default=0.5)
 
-# =========================================================
-# 3. Dataset
-# =========================================================
-class EnzymeSubstrateDataset(Dataset):
-    def __init__(self,df,esm_dict,mol_dict):
-        self.df=df.reset_index(drop=True)
-        self.esm_dict=esm_dict
-        self.mol_dict=mol_dict
-        self.labels=activity_to_class(self.df["Activity"].values)
+    parser.add_argument('--deep_cross_query_dim', type=int, default=8)
+    parser.add_argument('--deep_cross_return_dim', type=int, default=32)
+    parser.add_argument('--deep_cross_num_head', type=int, default=1)
+    parser.add_argument('--deep_cross_dropout', type=float, default=0.25)
+    parser.add_argument('--deep_cross_residual_coef', type=float, default=0)
 
-    def __len__(self): return len(self.df)
+    parser.add_argument('--out_scores', type=int, default=3)
+    return parser.parse_args()
 
-    def __getitem__(self,i):
-        row=self.df.iloc[i]
-        name=str(row["Name"])
-        sm=str(row["SM"])
-        esm_item=self.esm_dict[name]
-        mol_feat=self.mol_dict[sm]
-        esm_feat=esm_item["emb"].float() if isinstance(esm_item,dict) else esm_item.float()
-        esm_mask=esm_item["mask"].float() if isinstance(esm_item,dict) else torch.ones(esm_feat.shape[0],dtype=torch.float32)
-        mol_feat=torch.as_tensor(mol_feat,dtype=torch.float32)
-        sm_load=torch.tensor([float(row["SM_norm"])],dtype=torch.float32)
-        enz_load=torch.tensor([float(row["Enz_norm"])],dtype=torch.float32)
-        label=torch.tensor(self.labels[i],dtype=torch.long)
-        return esm_feat,esm_mask,mol_feat,sm_load,enz_load,label
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-# =========================================================
-# 4. Collate
-# =========================================================
-def collate_fn(batch):
-    esm_feats,esm_masks,mol_feats,sm_loads,enz_loads,labels=zip(*batch)
-    max_len=max(x.shape[0] for x in esm_feats)
-    feat_dim=esm_feats[0].shape[1]
-    esm_batch=torch.zeros(len(batch),max_len,feat_dim,dtype=torch.float32)
-    mask_batch=torch.zeros(len(batch),max_len,dtype=torch.float32)
-    for i,(feat,mask) in enumerate(zip(esm_feats,esm_masks)):
-        L=min(feat.shape[0],max_len)
-        esm_batch[i,:L]=feat[:L]
-        mask_batch[i,:L]=mask[:L]
-    mol_batch=torch.stack(mol_feats)
-    sm_batch=torch.stack(sm_loads)
-    enz_batch=torch.stack(enz_loads)
-    label_batch=torch.stack(labels)
-    return esm_batch,mask_batch,mol_batch,sm_batch,enz_batch,label_batch
+class MultiFeatureDataset(Dataset):
+    def __init__(self, x_esm, x_unirep, x_prott5, labels):
+        self.x_esm = torch.tensor(x_esm, dtype=torch.float32)
+        self.x_unirep = torch.tensor(x_unirep, dtype=torch.float32)
+        self.x_prott5 = torch.tensor(x_prott5, dtype=torch.float32)
+        self.labels = torch.tensor(labels, dtype=torch.long)
 
-# =========================================================
-# 5. 模型
-# =========================================================
-class EnzymeSubstrateThreeClassClassifier(nn.Module):
-    def __init__(self,dropout=0.2):
-        super().__init__()
-        self.esm_proj=nn.Sequential(nn.Linear(1280,512),nn.ReLU(),nn.Dropout(dropout),nn.Linear(512,256))
-        self.mol_proj=nn.Sequential(nn.Linear(768,512),nn.ReLU(),nn.Dropout(dropout),nn.Linear(512,256))
-        encoder_layer=nn.TransformerEncoderLayer(d_model=256,nhead=8,dim_feedforward=512,dropout=dropout,batch_first=True)
-        self.esm_encoder=nn.TransformerEncoder(encoder_layer,num_layers=2,enable_nested_tensor=False)
-        self.sm_proj=nn.Sequential(nn.Linear(1,64),nn.ReLU(),nn.Linear(64,128),nn.LayerNorm(128))
-        self.enz_proj=nn.Sequential(nn.Linear(1,64),nn.ReLU(),nn.Linear(64,128),nn.LayerNorm(128))
-        input_dim=256+256+128+128
-        self.fc1=nn.Linear(input_dim,256)
-        self.bn1=nn.BatchNorm1d(256)
-        self.fc2=nn.Linear(256,256)
-        self.bn2=nn.BatchNorm1d(256)
-        self.fc3=nn.Linear(256,128)
-        self.bn3=nn.BatchNorm1d(128)
-        self.dropout=nn.Dropout(0.2)
-        self.classifier=nn.Linear(128,NUM_CLASSES)
+    def __len__(self):
+        return len(self.labels)
 
-    def forward(self,esm_feat,esm_mask,mol_feat,sm_load,enz_load):
-        esm_feat=self.esm_proj(esm_feat)
-        src_mask=(esm_mask==0).bool()
-        esm_feat=self.esm_encoder(esm_feat,src_key_padding_mask=src_mask)
-        mask=esm_mask.unsqueeze(-1).float()
-        esm_pooled=(esm_feat*mask).sum(dim=1)/(mask.sum(dim=1).clamp(min=1e-8))
-        mol_proj=self.mol_proj(mol_feat)
-        sm_proj=self.sm_proj(sm_load)
-        enz_proj=self.enz_proj(enz_load)
-        x=torch.cat([esm_pooled,enz_proj,mol_proj,sm_proj],dim=-1)
-        x=F.relu(self.bn1(self.fc1(x)))
-        residual=x
-        x=F.relu(self.bn2(self.fc2(x)))
-        x=self.dropout(x)
-        x=x+residual
-        x=F.relu(self.bn3(self.fc3(x)))
-        logits=self.classifier(x)
-        return logits
+    def __getitem__(self, idx):
+        return self.x_esm[idx], self.x_unirep[idx], self.x_prott5[idx], self.labels[idx]
 
-# =========================================================
-# 6. 加载原始预训练权重
-# =========================================================
-def load_pretrained(model,checkpoint_path):
-    checkpoint=torch.load(checkpoint_path,map_location="cpu")
-    if isinstance(checkpoint,dict) and "state_dict" in checkpoint: state_dict=checkpoint["state_dict"]
-    elif isinstance(checkpoint,dict) and "model" in checkpoint and isinstance(checkpoint["model"],dict): state_dict=checkpoint["model"]
-    else: state_dict=checkpoint
-    state_dict={k.replace("module.",""):v for k,v in state_dict.items()}
-    state_dict.pop("fc4.weight",None)
-    state_dict.pop("fc4.bias",None)
-    missing,unexpected=model.load_state_dict(state_dict,strict=False)
-    nn.init.xavier_uniform_(model.classifier.weight)
-    nn.init.zeros_(model.classifier.bias)
-    print("Pretrained loaded.")
-    print("Missing keys:",missing)
-    print("Unexpected keys:",unexpected)
-    return model
+def load_and_align_data(args):
+    print(f"📦 loading {args.num_classes} dataset...")
 
-# =========================================================
-# 7. 读取数据
-# =========================================================
-print("\nLoading data...")
-df=pd.read_csv(DATA_PATH)
-esm_dict=pd.read_pickle(ESM_PATH)
-mol_dict=pd.read_pickle(MOL_PATH)
+    cluster_csv_path = os.path.join(args.data_dir, '5ml_homology_clusters_unified_train.csv')
+    cluster_df = pd.read_csv(cluster_csv_path)
 
-print("Total data:",len(df))
-print("ESM:",len(esm_dict))
-print("MolFormer:",len(mol_dict))
+    cluster_df = cluster_df.dropna(subset=['Sequence_ID']).copy()
+    def safe_extract_label(seq_id):
+        try:
+            return int(str(seq_id).split('_')[-1])
+        except ValueError:
+            return -1
+    cluster_df['Label'] = cluster_df['Sequence_ID'].apply(safe_extract_label)
+    if (cluster_df['Label'] == -1).sum() > 0:
+        cluster_df = cluster_df[cluster_df['Label'] != -1].copy()
 
-# =========================================================
-# 8. 读取 split
-# =========================================================
-def read_split(path):
-    values=pd.read_csv(path,header=None).iloc[:,0].astype(str).tolist()
-    return set(values)
-
-train_ids=read_split(os.path.join(SPLIT_DIR,"train.txt"))
-val_ids=read_split(os.path.join(SPLIT_DIR,"val.txt"))
-test_ids=read_split(os.path.join(SPLIT_DIR,"test.txt"))
-
-df["Name"]=df["Name"].astype(str)
-df_train=df[df["Name"].isin(train_ids)].copy()
-df_val=df[df["Name"].isin(val_ids)].copy()
-df_test=df[df["Name"].isin(test_ids)].copy()
-
-print("Train:",len(df_train))
-print("Val:",len(df_val))
-print("Test:",len(df_test))
-
-# =========================================================
-# 9. 检查三分类分布
-# =========================================================
-train_cls=activity_to_class(df_train["Activity"].values)
-val_cls=activity_to_class(df_val["Activity"].values)
-test_cls=activity_to_class(df_test["Activity"].values)
-
-print("\n===== Class distribution =====")
-for name,y in [("Train",train_cls),("Val",val_cls),("Test",test_cls)]:
-    counts=np.bincount(y,minlength=NUM_CLASSES)
-    print(f"{name}: Class0={counts[0]}, Class1={counts[1]}, Class2={counts[2]}, Total={len(y)}")
-
-# =========================================================
-# 10. DataLoader
-# =========================================================
-train_dataset=EnzymeSubstrateDataset(df_train,esm_dict,mol_dict)
-val_dataset=EnzymeSubstrateDataset(df_val,esm_dict,mol_dict)
-test_dataset=EnzymeSubstrateDataset(df_test,esm_dict,mol_dict)
-
-train_loader=DataLoader(train_dataset,batch_size=BATCH_SIZE,shuffle=True,num_workers=0,pin_memory=True,collate_fn=collate_fn)
-val_loader=DataLoader(val_dataset,batch_size=BATCH_SIZE,shuffle=False,num_workers=0,pin_memory=True,collate_fn=collate_fn)
-test_loader=DataLoader(test_dataset,batch_size=BATCH_SIZE,shuffle=False,num_workers=0,pin_memory=True,collate_fn=collate_fn)
-
-# =========================================================
-# 11. 类别权重
-# =========================================================
-class_counts=np.bincount(train_cls,minlength=NUM_CLASSES)
-class_weights=len(train_cls)/(NUM_CLASSES*np.maximum(class_counts,1))
-class_weights=torch.tensor(class_weights,dtype=torch.float32,device=device)
-
-print("\nClass counts:",class_counts)
-print("Class weights:",class_weights.detach().cpu().numpy())
-
-# =========================================================
-# 12. 初始化模型
-# =========================================================
-model=EnzymeSubstrateThreeClassClassifier(dropout=0.2)
-model=load_pretrained(model,PRETRAINED_PATH)
-model=model.to(device)
-
-criterion=nn.CrossEntropyLoss(weight=class_weights)
-
-# =========================================================
-# 13. Train Epoch
-# =========================================================
-def train_epoch(model,loader,criterion,optimizer,device):
-    model.train()
-    total_loss=0.0
-    total_num=0
-    for esm_feat,esm_mask,mol_feat,sm_load,enz_load,label in loader:
-        esm_feat=esm_feat.to(device,non_blocking=True)
-        esm_mask=esm_mask.to(device,non_blocking=True)
-        mol_feat=mol_feat.to(device,non_blocking=True)
-        sm_load=sm_load.to(device,non_blocking=True)
-        enz_load=enz_load.to(device,non_blocking=True)
-        label=label.to(device,non_blocking=True)
-        optimizer.zero_grad()
-        logits=model(esm_feat,esm_mask,mol_feat,sm_load,enz_load)
-        loss=criterion(logits,label)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(),max_norm=5.0)
-        optimizer.step()
-        total_loss+=loss.item()*label.size(0)
-        total_num+=label.size(0)
-    return total_loss/total_num
-
-# =========================================================
-# 14. Predict
-# =========================================================
-def predict(model,loader,device):
-    model.eval()
-    all_prob=[]
-    all_label=[]
-    with torch.no_grad():
-        for esm_feat,esm_mask,mol_feat,sm_load,enz_load,label in loader:
-            esm_feat=esm_feat.to(device,non_blocking=True)
-            esm_mask=esm_mask.to(device,non_blocking=True)
-            mol_feat=mol_feat.to(device,non_blocking=True)
-            sm_load=sm_load.to(device,non_blocking=True)
-            enz_load=enz_load.to(device,non_blocking=True)
-            logits=model(esm_feat,esm_mask,mol_feat,sm_load,enz_load)
-            prob=torch.softmax(logits,dim=1)
-            all_prob.append(prob.cpu().numpy())
-            all_label.append(label.numpy())
-    probabilities=np.concatenate(all_prob,axis=0)
-    labels=np.concatenate(all_label,axis=0).astype(int)
-    predictions=np.argmax(probabilities,axis=1)
-    return labels,probabilities,predictions
-
-# =========================================================
-# 15. 多分类评价
-# =========================================================
-def evaluate(y_true,y_prob,y_pred):
-    accuracy=accuracy_score(y_true,y_pred)
-    precision_macro=precision_score(y_true,y_pred,average="macro",zero_division=0)
-    recall_macro=recall_score(y_true,y_pred,average="macro",zero_division=0)
-    f1_macro=f1_score(y_true,y_pred,average="macro",zero_division=0)
-    f1_weighted=f1_score(y_true,y_pred,average="weighted",zero_division=0)
-    f1_each=f1_score(y_true,y_pred,average=None,labels=[0,1,2],zero_division=0)
-    cm=confusion_matrix(y_true,y_pred,labels=[0,1,2])
-    try:
-        auc_macro=roc_auc_score(y_true,y_prob,multi_class="ovr",average="macro",labels=[0,1,2])
-    except ValueError:
-        auc_macro=np.nan
-    return {"Accuracy":accuracy,"Precision_macro":precision_macro,"Recall_macro":recall_macro,"F1_macro":f1_macro,"F1_weighted":f1_weighted,"F1_class0":f1_each[0],"F1_class1":f1_each[1],"F1_class2":f1_each[2],"AUC_macro":auc_macro,"CM":cm}
-
-# =========================================================
-# 16. Stage 1：冻结特征提取部分，只训练分类头
-# =========================================================
-print("\n" + "="*70)
-print("Stage 1: Freeze backbone, train classifier")
-print("="*70)
-
-for p in model.parameters(): p.requires_grad=False
-for p in model.classifier.parameters(): p.requires_grad=True
-
-optimizer=torch.optim.AdamW(filter(lambda p:p.requires_grad,model.parameters()),lr=STAGE1_LR,weight_decay=WEIGHT_DECAY)
-
-best_f1=-1
-best_state=None
-best_epoch=0
-
-for epoch in range(1,STAGE1_EPOCHS+1):
-    train_loss=train_epoch(model,train_loader,criterion,optimizer,device)
-    y_val,prob_val,pred_val=predict(model,val_loader,device)
-    metrics=evaluate(y_val,prob_val,pred_val)
-    print(f"[Stage1][{epoch:03d}/{STAGE1_EPOCHS}] Loss={train_loss:.5f} Acc={metrics['Accuracy']:.4f} F1_macro={metrics['F1_macro']:.4f} F1_0={metrics['F1_class0']:.4f} F1_1={metrics['F1_class1']:.4f} F1_2={metrics['F1_class2']:.4f} AUC={metrics['AUC_macro']:.4f}")
-    if metrics["F1_macro"]>best_f1:
-        best_f1=metrics["F1_macro"]
-        best_state=deepcopy(model.state_dict())
-        best_epoch=epoch
-
-model.load_state_dict(best_state)
-print(f"Stage1 best epoch={best_epoch}, best F1_macro={best_f1:.4f}")
-
-# =========================================================
-# 17. Stage 2：解冻全部模型进行微调
-# =========================================================
-print("\n" + "="*70)
-print("Stage 2: Fine-tune entire model")
-print("="*70)
-
-for p in model.parameters(): p.requires_grad=True
-
-optimizer=torch.optim.AdamW(model.parameters(),lr=STAGE2_LR,weight_decay=WEIGHT_DECAY)
-scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode="max",factor=REDUCE_FACTOR,patience=REDUCE_PATIENCE)
-
-best_f1=-1
-best_state=None
-best_epoch=0
-early_stop_count=0
-
-best_path=os.path.join(OUTPUT_DIR,"best_model_3class.pth")
-
-for epoch in range(1,STAGE2_EPOCHS+1):
-    train_loss=train_epoch(model,train_loader,criterion,optimizer,device)
-    y_val,prob_val,pred_val=predict(model,val_loader,device)
-    metrics=evaluate(y_val,prob_val,pred_val)
-    current_lr=optimizer.param_groups[0]["lr"]
-    scheduler.step(metrics["F1_macro"])
-    print(f"[Stage2][{epoch:03d}/{STAGE2_EPOCHS}] Loss={train_loss:.5f} Acc={metrics['Accuracy']:.4f} F1_macro={metrics['F1_macro']:.4f} F1_weighted={metrics['F1_weighted']:.4f} F1_0={metrics['F1_class0']:.4f} F1_1={metrics['F1_class1']:.4f} F1_2={metrics['F1_class2']:.4f} AUC={metrics['AUC_macro']:.4f} LR={current_lr:.2e}")
-    if metrics["F1_macro"]>best_f1:
-        best_f1=metrics["F1_macro"]
-        best_state=deepcopy(model.state_dict())
-        best_epoch=epoch
-        early_stop_count=0
-        torch.save({"model":best_state,"num_classes":NUM_CLASSES,"activity_threshold_1":ACTIVITY_THRESHOLD_1,"activity_threshold_2":ACTIVITY_THRESHOLD_2,"class_weights":class_weights.detach().cpu()},best_path)
-        print(f"  --> Save best model, F1_macro={best_f1:.4f}")
+    if args.num_classes == 2:
+        df_filtered = cluster_df[cluster_df['Label'].isin([0, 2])].copy()
+        df_filtered['Label'] = df_filtered['Label'].replace({2: 1})
     else:
-        early_stop_count+=1
-    if early_stop_count>=EARLY_STOP_PATIENCE:
-        print(f"Early stopping at epoch {epoch}, best epoch={best_epoch}")
-        break
+        df_filtered = cluster_df.copy()
 
-# =========================================================
-# 18. 加载最佳模型
-# =========================================================
-checkpoint=torch.load(best_path,map_location=device)
-model.load_state_dict(checkpoint["model"])
-model=model.to(device)
+    print(f"-> filtered remaining: {len(df_filtered)}")
 
-# =========================================================
-# 19. Test
-# =========================================================
-print("\n" + "="*70)
-print("Final Test")
-print("="*70)
+    groups = df_filtered[args.sim_threshold].values
+    labels = df_filtered['Label'].values
+    target_seq_ids = df_filtered['Sequence_ID'].values
 
-y_test,prob_test,pred_test=predict(model,test_loader,device)
-test_metrics=evaluate(y_test,prob_test,pred_test)
+    print("⏳ aligning Sequence_ID...")
 
-print(f"Accuracy       : {test_metrics['Accuracy']:.4f}")
-print(f"Precision_macro: {test_metrics['Precision_macro']:.4f}")
-print(f"Recall_macro   : {test_metrics['Recall_macro']:.4f}")
-print(f"F1_macro       : {test_metrics['F1_macro']:.4f}")
-print(f"F1_weighted    : {test_metrics['F1_weighted']:.4f}")
-print(f"F1_class0      : {test_metrics['F1_class0']:.4f}")
-print(f"F1_class1      : {test_metrics['F1_class1']:.4f}")
-print(f"F1_class2      : {test_metrics['F1_class2']:.4f}")
-print(f"AUC_macro      : {test_metrics['AUC_macro']:.4f}")
-print("\nConfusion Matrix:")
-print(test_metrics["CM"])
+    def load_and_match_features(csv_filename, target_ids):
+        filepath = os.path.join(args.data_dir, csv_filename)
+        df_feat = pd.read_csv(filepath, header=None)
 
-# =========================================================
-# 20. 保存预测结果
-# =========================================================
-result=df_test.reset_index(drop=True).copy()
-result["True_Class"]=activity_to_class(result["Activity"].values)
-result["Pred_Class"]=pred_test
-result["Prob_Class_0"]=prob_test[:,0]
-result["Prob_Class_1"]=prob_test[:,1]
-result["Prob_Class_2"]=prob_test[:,2]
+        df_feat.rename(columns={0: 'Sequence_ID'}, inplace=True)
+        df_feat.set_index('Sequence_ID', inplace=True)
 
-prediction_path=os.path.join(OUTPUT_DIR,"test_predictions_3class.csv")
-result.to_csv(prediction_path,index=False)
+        try:
+            aligned_df = df_feat.loc[target_ids]
+        except KeyError as e:
+            raise KeyError(f"❌ Error： {csv_filename} can't find sequence ID。\nmsg: {e}")
 
-# =========================================================
-# 21. 保存评价结果
-# =========================================================
-metrics_to_save={k:v for k,v in test_metrics.items() if k!="CM"}
-metrics_to_save["Confusion_Matrix"]=test_metrics["CM"].tolist()
-metrics_to_save["Class_0"]="Activity < 0.1"
-metrics_to_save["Class_1"]="0.1 <= Activity < 1"
-metrics_to_save["Class_2"]="Activity >= 1"
-metrics_to_save["Best_Epoch"]=best_epoch
+        return aligned_df.values.astype(np.float32)
 
-with open(os.path.join(OUTPUT_DIR,"test_metrics_3class.json"),"w",encoding="utf-8") as f:
-    json.dump(metrics_to_save,f,ensure_ascii=False,indent=2)
+    X_esm = load_and_match_features('x_5ml_esm2_dataset_with_IDs.csv', target_seq_ids)
+    X_unirep = load_and_match_features('x_5ml_unirep_dataset_with_IDs.csv', target_seq_ids)
+    X_prott5 = load_and_match_features('x_5ml_protT5_dataset_with_IDs.csv', target_seq_ids)
 
-# =========================================================
-# 22. 保存分类参数
-# =========================================================
-config={
-    "seed":SEED,
-    "batch_size":BATCH_SIZE,
-    "num_classes":NUM_CLASSES,
-    "activity_threshold_1":ACTIVITY_THRESHOLD_1,
-    "activity_threshold_2":ACTIVITY_THRESHOLD_2,
-    "class_definition":{
-        "0":"Activity < 0.1",
-        "1":"0.1 <= Activity < 1",
-        "2":"Activity >= 1"
-    },
-    "stage1_epochs":STAGE1_EPOCHS,
-    "stage1_lr":STAGE1_LR,
-    "stage2_epochs":STAGE2_EPOCHS,
-    "stage2_lr":STAGE2_LR,
-    "weight_decay":WEIGHT_DECAY
-}
+    print(f"✅ feature ID aligned - ESM2: {X_esm.shape}, UniRep: {X_unirep.shape}, ProtT5: {X_prott5.shape}")
+    return X_esm, X_unirep, X_prott5, labels, groups
 
-with open(os.path.join(OUTPUT_DIR,"config_3class.json"),"w",encoding="utf-8") as f:
-    json.dump(config,f,ensure_ascii=False,indent=2)
 
-print("\nDone.")
-print("Best model :",best_path)
-print("Predictions:",prediction_path)
-print("Output dir :",OUTPUT_DIR)
+def standardize_split(X, train_idx, val_idx, test_idx):
+    """只用训练折统计量做标准化，避免验证/测试信息泄露。
+    三种特征量纲差异很大（ESM2 std≈0.20, UniRep≈0.11, ProtT5≈0.04），不标准化时 ProtT5 信号会被压制。
+    """
+    mean = X[train_idx].mean(axis=0, keepdims=True)
+    std = X[train_idx].std(axis=0, keepdims=True)
+    std[std < 1e-6] = 1.0
+    splits = tuple((X[i] - mean) / std for i in (train_idx, val_idx, test_idx))
+    return splits, mean.astype(np.float32), std.astype(np.float32)
+
+def evaluate(model, dataloader, criterion, device, num_classes, args):
+    model.eval()
+    total_loss = 0.0
+    all_preds, all_labels, all_probs = [], [], []
+
+    with torch.no_grad():
+        for x_esm, x_unirep, x_prott5, y in dataloader:
+            x_esm, x_unirep, x_prott5, y = x_esm.to(device), x_unirep.to(device), x_prott5.to(device), y.to(device)
+
+            logits = model(x_esm, x_unirep, x_prott5, device=device,
+                                 first_self_query_dim=args.first_self_query_dim,
+                                 deep_self=True,
+                                 deep_self_query_dim=args.deep_self_query_dim,
+                                 deep_cross_query_dim=args.deep_cross_query_dim)
+
+            loss = criterion(logits, y)
+            total_loss += loss.item() * y.size(0)
+
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(probs, dim=1)
+
+            all_labels.extend(y.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    total_loss /= len(dataloader.dataset)
+    acc = accuracy_score(all_labels, all_preds)
+    mcc = matthews_corrcoef(all_labels, all_preds)
+
+    metrics = {
+        'Loss': total_loss,
+        'Accuracy': acc,
+        'MCC': mcc
+    }
+
+    if num_classes == 2:
+        metrics['Precision'] = precision_score(all_labels, all_preds, zero_division=0)
+        metrics['Recall'] = recall_score(all_labels, all_preds, zero_division=0)
+        metrics['F1'] = f1_score(all_labels, all_preds, zero_division=0)
+
+        pos_probs = [p[1] for p in all_probs]
+        metrics['ROC_AUC'] = roc_auc_score(all_labels, pos_probs)
+        metrics['PR_AUC'] = average_precision_score(all_labels, pos_probs)
+
+        monitor_auc = metrics['ROC_AUC']
+    else:
+        metrics['Macro_Precision'] = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+        metrics['Macro_Recall'] = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+        metrics['Macro_F1'] = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
+        metrics['Macro_ROC_AUC'] = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
+
+        monitor_auc = metrics['Macro_ROC_AUC']
+
+    return monitor_auc, metrics
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    run_name = f"ProtSATT_{args.num_classes}Class_{args.sim_threshold}"
+    save_path = os.path.join(args.save_dir, run_name)
+    os.makedirs(save_path, exist_ok=True)
+
+    print(f"=== Starting ProtSATT {args.num_classes}-Class Training on {device} ===")
+    X_esm, X_unirep, X_prott5, labels, groups = load_and_align_data(args)
+
+    sgkf_outer = StratifiedGroupKFold(n_splits=10, shuffle=True, random_state=args.seed)
+    outer_fold_results = []
+
+    for fold, (train_val_idx, test_idx) in enumerate(sgkf_outer.split(X_esm, labels, groups)):
+        print(f"\n" + "="*50)
+        print(f"🚀 Outer Fold {fold+1}/10")
+
+        X_tv_esm = X_esm[train_val_idx]
+        y_tv, groups_tv = labels[train_val_idx], groups[train_val_idx]
+
+        sgkf_inner = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=args.seed + fold)
+        inner_train_sub_idx, inner_val_sub_idx = next(sgkf_inner.split(X_tv_esm, y_tv, groups_tv))
+
+        train_idx = train_val_idx[inner_train_sub_idx]
+        val_idx = train_val_idx[inner_val_sub_idx]
+
+        train_groups, val_groups, test_groups = set(groups[train_idx]), set(groups[val_idx]), set(groups[test_idx])
+        assert train_groups.isdisjoint(val_groups) and train_groups.isdisjoint(test_groups) and val_groups.isdisjoint(test_groups), "⚠️ 严重数据泄露！"
+
+        # 只依赖训练折统计量的标准化
+        (X_tr_esm, X_va_esm, X_te_esm), esm_mean, esm_std = standardize_split(X_esm, train_idx, val_idx, test_idx)
+        (X_tr_uni, X_va_uni, X_te_uni), uni_mean, uni_std = standardize_split(X_unirep, train_idx, val_idx, test_idx)
+        (X_tr_pro, X_va_pro, X_te_pro), pro_mean, pro_std = standardize_split(X_prott5, train_idx, val_idx, test_idx)
+
+        # 保存该折的标准化统计量，推理时必须复用
+        np.savez(
+            os.path.join(save_path, f"scaler_fold_{fold+1}.npz"),
+            esm_mean=esm_mean, esm_std=esm_std,
+            unirep_mean=uni_mean, unirep_std=uni_std,
+            prott5_mean=pro_mean, prott5_std=pro_std,
+        )
+
+        train_dataset = MultiFeatureDataset(X_tr_esm, X_tr_uni, X_tr_pro, labels[train_idx])
+        val_dataset = MultiFeatureDataset(X_va_esm, X_va_uni, X_va_pro, labels[val_idx])
+        test_dataset = MultiFeatureDataset(X_te_esm, X_te_uni, X_te_pro, labels[test_idx])
+
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+
+        model = ProtSATT(
+            dropout=args.dropout,
+            first_self_query_dim=args.first_self_query_dim, first_self_return_dim=args.first_self_return_dim, first_self_num_head=args.first_self_num_head, first_self_dropout=args.first_self_dropout, first_self_residual_coef=args.first_self_residual_coef,
+            self_deep=args.self_deep,
+            deep_self_query_dim=args.deep_self_query_dim, deep_self_return_dim=args.deep_self_return_dim, deep_self_num_head=args.deep_self_num_head, deep_self_dropout=args.deep_self_dropout, deep_self_residual_coef=args.deep_self_residual_coef,
+            deep_cross_query_dim=args.deep_cross_query_dim, deep_cross_return_dim=args.deep_cross_return_dim, deep_cross_num_head=args.deep_cross_num_head, deep_cross_dropout=args.deep_cross_dropout, deep_cross_residual_coef=args.deep_cross_residual_coef,
+            out_scores=args.out_scores,
+        ).to(device)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=args.weight_decay)
+
+        # 类别不平衡：按训练折频率取倒数权重（3041 / 4978 / 6296）
+        class_counts = np.bincount(labels[train_idx], minlength=args.num_classes)
+        class_weights = np.zeros(args.num_classes, dtype=np.float32)
+        class_weights[class_counts > 0] = len(train_idx) / (args.num_classes * class_counts[class_counts > 0])
+        print(f"   class counts {class_counts.tolist()} -> weights {np.round(class_weights, 3).tolist()}")
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, device=device))
+        eval_criterion = nn.CrossEntropyLoss()  # 评估用无权重 loss，保证跨实验可比
+
+        scheduler = None
+        if args.scheduler == 'ReduceLROnPlateau':
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='max', factor=args.lr_factor, patience=args.lr_patience, min_lr=args.min_lr
+            )
+        elif args.scheduler == 'LambdaLR':
+            def lambda_lr(s):
+                warm_up = args.warmup
+                s += 1
+                return (32 ** -.5) * min(s ** -.5, s * warm_up ** -1.5)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda_lr)
+
+        best_val_score = -1.0
+        best_epoch = 0
+        patience_counter = 0
+
+        model_save_path = os.path.join(save_path, f"best_model_fold_{fold+1}.pth")
+
+        for epoch in range(args.epochs):
+            model.train()
+            total_loss = 0
+            for x_esm_b, x_unirep_b, x_prott5_b, y_b in train_loader:
+                x_esm_b, x_unirep_b, x_prott5_b, y_b = x_esm_b.to(device), x_unirep_b.to(device), x_prott5_b.to(device), y_b.to(device)
+
+                optimizer.zero_grad()
+                logits = model(x_esm_b, x_unirep_b, x_prott5_b, device=device,
+                                     first_self_query_dim=args.first_self_query_dim,
+                                     deep_self=True,
+                                     deep_self_query_dim=args.deep_self_query_dim,
+                                     deep_cross_query_dim=args.deep_cross_query_dim)
+
+                loss = criterion(logits, y_b)
+                total_loss += loss.item() * y_b.size(0)
+                loss.backward()
+                optimizer.step()
+            print(f"   Train Epoch {epoch+1:03d} [] | Train Loss: {total_loss / len(train_loader.dataset)}")
+            # 验证评估
+            val_monitor_auc, val_metrics = evaluate(model, val_loader, eval_criterion, device, args.num_classes, args)
+
+            # 选模型看 Macro-F1，ACC 会被多数类主导
+            monitor_value = val_metrics['Macro_F1'] if args.num_classes == 3 else val_metrics['F1']
+
+            if args.scheduler == 'ReduceLROnPlateau':
+                scheduler.step(monitor_value)
+            elif args.scheduler == 'LambdaLR':
+                scheduler.step()
+
+            current_lr = optimizer.param_groups[0]['lr']
+
+            if monitor_value > best_val_score:
+                best_val_score = monitor_value
+                best_epoch = epoch
+                torch.save(model.state_dict(), model_save_path)
+                patience_counter = 0
+                print(f"   Val Epoch {epoch+1:03d} [*] | Val ACC: {val_metrics['Accuracy']:.4f} | Val F1: {monitor_value:.4f} | Val AUC: {val_monitor_auc:.4f} | Val MCC: {val_metrics['MCC']:.4f} | LR: {current_lr:.2e} | LOSS: {val_metrics['Loss']:.4f}")
+            else:
+                patience_counter += 1
+                print(f"   Val Epoch {epoch+1:03d} [ ] | Val ACC: {val_metrics['Accuracy']:.4f} | Val F1: {monitor_value:.4f} | Val AUC: {val_monitor_auc:.4f} | Val MCC: {val_metrics['MCC']:.4f} | LR: {current_lr:.2e} | Patience: {patience_counter}/{args.patience} | LOSS: {val_metrics['Loss']:.4f}")
+
+            if patience_counter >= args.patience:
+                print(f"   🛑 early patience triggered！{args.patience} epoch didn't improve。")
+                break
+
+        print(f"   ✨ Inner-Val 最佳点: Epoch {best_epoch+1} (F1 = {best_val_score:.4f})")
+
+        model.load_state_dict(torch.load(model_save_path, map_location=device))
+        test_monitor_auc, test_metrics = evaluate(model, test_loader, eval_criterion, device, args.num_classes, args)
+
+        if args.num_classes == 2:
+            print(f"   🏆 Outer-Test 成绩 -> ROC_AUC: {test_metrics['ROC_AUC']:.4f} | PR_AUC: {test_metrics['PR_AUC']:.4f} | MCC: {test_metrics['MCC']:.4f} | F1: {test_metrics['F1']:.4f} | ACC: {test_metrics['Accuracy']:.4f}")
+        else:
+            print(f"   🏆 Outer-Test 成绩 -> Macro_AUC: {test_metrics['Macro_ROC_AUC']:.4f} | MCC: {test_metrics['MCC']:.4f} | Macro_F1: {test_metrics['Macro_F1']:.4f} | ACC: {test_metrics['Accuracy']:.4f}")
+
+        test_metrics['Fold'] = fold + 1
+        outer_fold_results.append(test_metrics)
+
+    df_res = pd.DataFrame(outer_fold_results)
+
+    cols = ['Fold'] + [c for c in df_res.columns if c != 'Fold']
+    df_res = df_res[cols]
+
+    mean_res = df_res.drop(columns=['Fold']).mean()
+    std_res = df_res.drop(columns=['Fold']).std()
+
+    report_path = os.path.join(save_path, "Rigorous_10Fold_Summary.txt")
+    with open(report_path, 'w') as f:
+        f.write(f"========== ProtSATT {args.num_classes}-Class Performance ({args.sim_threshold}) ==========\n\n")
+
+        f.write("--- Fold Details ---\n")
+        f.write(df_res.to_string(index=False) + "\n\n")
+
+        f.write("--- Overall Average ---\n")
+        for metric in mean_res.index:
+            line = f"{metric:<15}: {mean_res[metric]:.4f} ± {std_res[metric]:.4f}\n"
+            print(line.strip())
+            f.write(line)
+
+    csv_path = os.path.join(save_path, "Rigorous_10Fold_Summary.csv")
+    df_res.to_csv(csv_path, index=False)
+
+    print(f"\n✅ saved: {save_path}")
+
+if __name__ == "__main__":
+    main()
