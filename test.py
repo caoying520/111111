@@ -1,371 +1,629 @@
-import os
-import argparse
-import numpy as np
-import pandas as pd
+#项目的核心。定义了完整的神经网络架构，包含以下组件：<br>• SelfAttention — 自注意力模块（用 Swish 替代 Softmax）<br>• CrossAttention — 交叉注意力模块<br>• ProtSATT — 主模型：接收3种嵌入，经 Self-Attention → Deep Self-Attention → 6路 Cross-Attention → 输出层<br>• multi_layer_attention_2input / 1input — 消融实验用的简化版模型<br>• multi_layer_attention_no_self / no_cross — 消融实验（分别去除 Self/Cross 注意力）
+
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import StratifiedGroupKFold
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    matthews_corrcoef, roc_auc_score, average_precision_score
-)
-
-from Model import ProtSATT
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="ProtSATT")
-    parser.add_argument('--num_classes', type=int, default=3, choices=[2, 3])
-    parser.add_argument('--sim_threshold', type=str, default='Sim_40')
-    parser.add_argument('--scheduler', type=str, default='LambdaLR') # ReduceLROnPlateau LambdaLR
-    parser.add_argument('--epochs', type=int, default=1500)
-    parser.add_argument('--warmup', type=int, default=150) # LambdaLR，按 epoch 计
-    parser.add_argument('--patience', type=int, default=150)
-    parser.add_argument('--lr_patience', type=int, default=20) # 5 ReduceLROnPlateau
-    parser.add_argument('--lr_factor', type=float, default=0.5) # 0.5 ReduceLROnPlateau
-    parser.add_argument('--min_lr', type=float, default=1e-4) # 1e-6 ReduceLROnPlateau
-    parser.add_argument('--batch_size', type=int, default=2048)
-    parser.add_argument('--lr', type=float, default=1e-2) # 1e-3
-    parser.add_argument('--weight_decay', type=float, default=0.05)
-    parser.add_argument('--seed', type=int, default=2025) # 42
-    parser.add_argument('--data_dir', type=str, default=r'/data/caoying/softwares/ProtSATT/new_train/Expression/feature_train')
-    parser.add_argument('--save_dir', type=str, default=r'/data/caoying/softwares/ProtSATT/new_train/Expression/result/3_lables_experiment_train3/checkpoints_3labels_lr1e-2_LambdaLR_monitorACC')
-
-    parser.add_argument('--dropout', type=float, default=0.25)
-
-    parser.add_argument('--first_self_query_dim', type=int, default=32)
-    parser.add_argument('--first_self_return_dim', type=int, default=512)
-    parser.add_argument('--first_self_num_head', type=int, default=1)
-    parser.add_argument('--first_self_dropout', type=float, default=0.25)
-    parser.add_argument('--first_self_residual_coef', type=float, default=0)
-
-    parser.add_argument('--self_deep', type=int, default=1)
-    parser.add_argument('--deep_self_query_dim', type=int, default=16)
-    parser.add_argument('--deep_self_return_dim', type=int, default=128)
-    parser.add_argument('--deep_self_num_head', type=int, default=1)
-    parser.add_argument('--deep_self_dropout', type=float, default=0.25)
-    parser.add_argument('--deep_self_residual_coef', type=float, default=0.5)
-
-    parser.add_argument('--deep_cross_query_dim', type=int, default=8)
-    parser.add_argument('--deep_cross_return_dim', type=int, default=32)
-    parser.add_argument('--deep_cross_num_head', type=int, default=1)
-    parser.add_argument('--deep_cross_dropout', type=float, default=0.25)
-    parser.add_argument('--deep_cross_residual_coef', type=float, default=0)
-
-    parser.add_argument('--out_scores', type=int, default=3)
-    return parser.parse_args()
-
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-class MultiFeatureDataset(Dataset):
-    def __init__(self, x_esm, x_unirep, x_prott5, labels):
-        self.x_esm = torch.tensor(x_esm, dtype=torch.float32)
-        self.x_unirep = torch.tensor(x_unirep, dtype=torch.float32)
-        self.x_prott5 = torch.tensor(x_prott5, dtype=torch.float32)
-        self.labels = torch.tensor(labels, dtype=torch.long)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        return self.x_esm[idx], self.x_unirep[idx], self.x_prott5[idx], self.labels[idx]
-
-def load_and_align_data(args):
-    print(f"📦 loading {args.num_classes} dataset...")
-
-    cluster_csv_path = os.path.join(args.data_dir, '5ml_homology_clusters_unified_train.csv')
-    cluster_df = pd.read_csv(cluster_csv_path)
-
-    cluster_df = cluster_df.dropna(subset=['Sequence_ID']).copy()
-    def safe_extract_label(seq_id):
-        try:
-            return int(str(seq_id).split('_')[-1])
-        except ValueError:
-            return -1
-    cluster_df['Label'] = cluster_df['Sequence_ID'].apply(safe_extract_label)
-    if (cluster_df['Label'] == -1).sum() > 0:
-        cluster_df = cluster_df[cluster_df['Label'] != -1].copy()
-
-    if args.num_classes == 2:
-        df_filtered = cluster_df[cluster_df['Label'].isin([0, 2])].copy()
-        df_filtered['Label'] = df_filtered['Label'].replace({2: 1})
-    else:
-        df_filtered = cluster_df.copy()
-
-    print(f"-> filtered remaining: {len(df_filtered)}")
-
-    groups = df_filtered[args.sim_threshold].values
-    labels = df_filtered['Label'].values
-    target_seq_ids = df_filtered['Sequence_ID'].values
-
-    print("⏳ aligning Sequence_ID...")
-
-    def load_and_match_features(csv_filename, target_ids):
-        filepath = os.path.join(args.data_dir, csv_filename)
-        df_feat = pd.read_csv(filepath, header=None)
-
-        df_feat.rename(columns={0: 'Sequence_ID'}, inplace=True)
-        df_feat.set_index('Sequence_ID', inplace=True)
-
-        try:
-            aligned_df = df_feat.loc[target_ids]
-        except KeyError as e:
-            raise KeyError(f"❌ Error： {csv_filename} can't find sequence ID。\nmsg: {e}")
-
-        return aligned_df.values.astype(np.float32)
-
-    X_esm = load_and_match_features('x_5ml_esm2_dataset_with_IDs.csv', target_seq_ids)
-    X_unirep = load_and_match_features('x_5ml_unirep_dataset_with_IDs.csv', target_seq_ids)
-    X_prott5 = load_and_match_features('x_5ml_protT5_dataset_with_IDs.csv', target_seq_ids)
-
-    print(f"✅ feature ID aligned - ESM2: {X_esm.shape}, UniRep: {X_unirep.shape}, ProtT5: {X_prott5.shape}")
-    return X_esm, X_unirep, X_prott5, labels, groups
-
-
-def standardize_split(X, train_idx, val_idx, test_idx):
-    """只用训练折统计量做标准化，避免验证/测试信息泄露。
-    三种特征量纲差异很大（ESM2 std≈0.20, UniRep≈0.11, ProtT5≈0.04），不标准化时 ProtT5 信号会被压制。
-    """
-    mean = X[train_idx].mean(axis=0, keepdims=True)
-    std = X[train_idx].std(axis=0, keepdims=True)
-    std[std < 1e-6] = 1.0
-    splits = tuple((X[i] - mean) / std for i in (train_idx, val_idx, test_idx))
-    return splits, mean.astype(np.float32), std.astype(np.float32)
-
-def evaluate(model, dataloader, criterion, device, num_classes, args):
-    model.eval()
-    total_loss = 0.0
-    all_preds, all_labels, all_probs = [], [], []
-
-    with torch.no_grad():
-        for x_esm, x_unirep, x_prott5, y in dataloader:
-            x_esm, x_unirep, x_prott5, y = x_esm.to(device), x_unirep.to(device), x_prott5.to(device), y.to(device)
-
-            logits = model(x_esm, x_unirep, x_prott5, device=device,
-                                 first_self_query_dim=args.first_self_query_dim,
-                                 deep_self=True,
-                                 deep_self_query_dim=args.deep_self_query_dim,
-                                 deep_cross_query_dim=args.deep_cross_query_dim)
-
-            loss = criterion(logits, y)
-            total_loss += loss.item() * y.size(0)
-
-            probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
-
-            all_labels.extend(y.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-
-    total_loss /= len(dataloader.dataset)
-    acc = accuracy_score(all_labels, all_preds)
-    mcc = matthews_corrcoef(all_labels, all_preds)
-
-    metrics = {
-        'Loss': total_loss,
-        'Accuracy': acc,
-        'MCC': mcc
-    }
-
-    if num_classes == 2:
-        metrics['Precision'] = precision_score(all_labels, all_preds, zero_division=0)
-        metrics['Recall'] = recall_score(all_labels, all_preds, zero_division=0)
-        metrics['F1'] = f1_score(all_labels, all_preds, zero_division=0)
-
-        pos_probs = [p[1] for p in all_probs]
-        metrics['ROC_AUC'] = roc_auc_score(all_labels, pos_probs)
-        metrics['PR_AUC'] = average_precision_score(all_labels, pos_probs)
-
-        monitor_auc = metrics['ROC_AUC']
-    else:
-        metrics['Macro_Precision'] = precision_score(all_labels, all_preds, average='macro', zero_division=0)
-        metrics['Macro_Recall'] = recall_score(all_labels, all_preds, average='macro', zero_division=0)
-        metrics['Macro_F1'] = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-
-        metrics['Macro_ROC_AUC'] = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
-
-        monitor_auc = metrics['Macro_ROC_AUC']
-
-    return monitor_auc, metrics
-
-def main():
-    args = parse_args()
-    set_seed(args.seed)
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    run_name = f"ProtSATT_{args.num_classes}Class_{args.sim_threshold}"
-    save_path = os.path.join(args.save_dir, run_name)
-    os.makedirs(save_path, exist_ok=True)
-
-    print(f"=== Starting ProtSATT {args.num_classes}-Class Training on {device} ===")
-    X_esm, X_unirep, X_prott5, labels, groups = load_and_align_data(args)
-
-    sgkf_outer = StratifiedGroupKFold(n_splits=10, shuffle=True, random_state=args.seed)
-    outer_fold_results = []
-
-    for fold, (train_val_idx, test_idx) in enumerate(sgkf_outer.split(X_esm, labels, groups)):
-        print(f"\n" + "="*50)
-        print(f"🚀 Outer Fold {fold+1}/10")
-
-        X_tv_esm = X_esm[train_val_idx]
-        y_tv, groups_tv = labels[train_val_idx], groups[train_val_idx]
-
-        sgkf_inner = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=args.seed + fold)
-        inner_train_sub_idx, inner_val_sub_idx = next(sgkf_inner.split(X_tv_esm, y_tv, groups_tv))
-
-        train_idx = train_val_idx[inner_train_sub_idx]
-        val_idx = train_val_idx[inner_val_sub_idx]
-
-        train_groups, val_groups, test_groups = set(groups[train_idx]), set(groups[val_idx]), set(groups[test_idx])
-        assert train_groups.isdisjoint(val_groups) and train_groups.isdisjoint(test_groups) and val_groups.isdisjoint(test_groups), "⚠️ 严重数据泄露！"
-
-        # 只依赖训练折统计量的标准化
-        (X_tr_esm, X_va_esm, X_te_esm), esm_mean, esm_std = standardize_split(X_esm, train_idx, val_idx, test_idx)
-        (X_tr_uni, X_va_uni, X_te_uni), uni_mean, uni_std = standardize_split(X_unirep, train_idx, val_idx, test_idx)
-        (X_tr_pro, X_va_pro, X_te_pro), pro_mean, pro_std = standardize_split(X_prott5, train_idx, val_idx, test_idx)
-
-        # 保存该折的标准化统计量，推理时必须复用
-        np.savez(
-            os.path.join(save_path, f"scaler_fold_{fold+1}.npz"),
-            esm_mean=esm_mean, esm_std=esm_std,
-            unirep_mean=uni_mean, unirep_std=uni_std,
-            prott5_mean=pro_mean, prott5_std=pro_std,
-        )
-
-        train_dataset = MultiFeatureDataset(X_tr_esm, X_tr_uni, X_tr_pro, labels[train_idx])
-        val_dataset = MultiFeatureDataset(X_va_esm, X_va_uni, X_va_pro, labels[val_idx])
-        test_dataset = MultiFeatureDataset(X_te_esm, X_te_uni, X_te_pro, labels[test_idx])
-
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-
-        model = ProtSATT(
-            dropout=args.dropout,
-            first_self_query_dim=args.first_self_query_dim, first_self_return_dim=args.first_self_return_dim, first_self_num_head=args.first_self_num_head, first_self_dropout=args.first_self_dropout, first_self_residual_coef=args.first_self_residual_coef,
-            self_deep=args.self_deep,
-            deep_self_query_dim=args.deep_self_query_dim, deep_self_return_dim=args.deep_self_return_dim, deep_self_num_head=args.deep_self_num_head, deep_self_dropout=args.deep_self_dropout, deep_self_residual_coef=args.deep_self_residual_coef,
-            deep_cross_query_dim=args.deep_cross_query_dim, deep_cross_return_dim=args.deep_cross_return_dim, deep_cross_num_head=args.deep_cross_num_head, deep_cross_dropout=args.deep_cross_dropout, deep_cross_residual_coef=args.deep_cross_residual_coef,
-            out_scores=args.out_scores,
-        ).to(device)
-
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=args.weight_decay)
-
-        # 类别不平衡：按训练折频率取倒数权重（3041 / 4978 / 6296）
-        class_counts = np.bincount(labels[train_idx], minlength=args.num_classes)
-        class_weights = np.zeros(args.num_classes, dtype=np.float32)
-        class_weights[class_counts > 0] = len(train_idx) / (args.num_classes * class_counts[class_counts > 0])
-        print(f"   class counts {class_counts.tolist()} -> weights {np.round(class_weights, 3).tolist()}")
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, device=device))
-        eval_criterion = nn.CrossEntropyLoss()  # 评估用无权重 loss，保证跨实验可比
-
-        scheduler = None
-        if args.scheduler == 'ReduceLROnPlateau':
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='max', factor=args.lr_factor, patience=args.lr_patience, min_lr=args.min_lr
-            )
-        elif args.scheduler == 'LambdaLR':
-            def lambda_lr(s):
-                warm_up = args.warmup
-                s += 1
-                return (32 ** -.5) * min(s ** -.5, s * warm_up ** -1.5)
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda_lr)
-
-        best_val_score = -1.0
-        best_epoch = 0
-        patience_counter = 0
-
-        model_save_path = os.path.join(save_path, f"best_model_fold_{fold+1}.pth")
-
-        for epoch in range(args.epochs):
-            model.train()
-            total_loss = 0
-            for x_esm_b, x_unirep_b, x_prott5_b, y_b in train_loader:
-                x_esm_b, x_unirep_b, x_prott5_b, y_b = x_esm_b.to(device), x_unirep_b.to(device), x_prott5_b.to(device), y_b.to(device)
-
-                optimizer.zero_grad()
-                logits = model(x_esm_b, x_unirep_b, x_prott5_b, device=device,
-                                     first_self_query_dim=args.first_self_query_dim,
-                                     deep_self=True,
-                                     deep_self_query_dim=args.deep_self_query_dim,
-                                     deep_cross_query_dim=args.deep_cross_query_dim)
-
-                loss = criterion(logits, y_b)
-                total_loss += loss.item() * y_b.size(0)
-                loss.backward()
-                optimizer.step()
-            print(f"   Train Epoch {epoch+1:03d} [] | Train Loss: {total_loss / len(train_loader.dataset)}")
-            # 验证评估
-            val_monitor_auc, val_metrics = evaluate(model, val_loader, eval_criterion, device, args.num_classes, args)
-
-            # 选模型看 Macro-F1，ACC 会被多数类主导
-            monitor_value = val_metrics['Macro_F1'] if args.num_classes == 3 else val_metrics['F1']
-
-            if args.scheduler == 'ReduceLROnPlateau':
-                scheduler.step(monitor_value)
-            elif args.scheduler == 'LambdaLR':
-                scheduler.step()
-
-            current_lr = optimizer.param_groups[0]['lr']
-
-            if monitor_value > best_val_score:
-                best_val_score = monitor_value
-                best_epoch = epoch
-                torch.save(model.state_dict(), model_save_path)
-                patience_counter = 0
-                print(f"   Val Epoch {epoch+1:03d} [*] | Val ACC: {val_metrics['Accuracy']:.4f} | Val F1: {monitor_value:.4f} | Val AUC: {val_monitor_auc:.4f} | Val MCC: {val_metrics['MCC']:.4f} | LR: {current_lr:.2e} | LOSS: {val_metrics['Loss']:.4f}")
-            else:
-                patience_counter += 1
-                print(f"   Val Epoch {epoch+1:03d} [ ] | Val ACC: {val_metrics['Accuracy']:.4f} | Val F1: {monitor_value:.4f} | Val AUC: {val_monitor_auc:.4f} | Val MCC: {val_metrics['MCC']:.4f} | LR: {current_lr:.2e} | Patience: {patience_counter}/{args.patience} | LOSS: {val_metrics['Loss']:.4f}")
-
-            if patience_counter >= args.patience:
-                print(f"   🛑 early patience triggered！{args.patience} epoch didn't improve。")
-                break
-
-        print(f"   ✨ Inner-Val 最佳点: Epoch {best_epoch+1} (F1 = {best_val_score:.4f})")
-
-        model.load_state_dict(torch.load(model_save_path, map_location=device))
-        test_monitor_auc, test_metrics = evaluate(model, test_loader, eval_criterion, device, args.num_classes, args)
-
-        if args.num_classes == 2:
-            print(f"   🏆 Outer-Test 成绩 -> ROC_AUC: {test_metrics['ROC_AUC']:.4f} | PR_AUC: {test_metrics['PR_AUC']:.4f} | MCC: {test_metrics['MCC']:.4f} | F1: {test_metrics['F1']:.4f} | ACC: {test_metrics['Accuracy']:.4f}")
+from torch import nn
+import torch.nn.functional as F
+import math
+
+# Standardization
+def standardization(seq):
+    seq[:] = (torch[:] - torch.mean(seq))/ torch.std(seq)
+    return seq
+
+def max_standardization(seq):
+    seq = (seq-torch.min(seq))/(torch.max(seq)-torch.min(seq))
+    return seq
+
+class LayerNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-12):
+        """Construct a layernorm module in the TF style (epsilon inside the square root).
+        """
+        super(LayerNorm, self).__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, x):
+        u = x.mean(-1, keepdim=True)
+        s = (x - u).pow(2).mean(-1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.variance_epsilon)
+        return self.weight * x + self.bias
+
+class Swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(Swish,self).__init__()
+        self.inplace=inplace
+    def forward(self, x):
+        if self.inplace:
+            x.mul_(torch.sigmoid(x))
+            return x
         else:
-            print(f"   🏆 Outer-Test 成绩 -> Macro_AUC: {test_metrics['Macro_ROC_AUC']:.4f} | MCC: {test_metrics['MCC']:.4f} | Macro_F1: {test_metrics['Macro_F1']:.4f} | ACC: {test_metrics['Accuracy']:.4f}")
+            return x*torch.sigmoid(x)
 
-        test_metrics['Fold'] = fold + 1
-        outer_fold_results.append(test_metrics)
+class ClippedLinearActivation(nn.Module):
+    def __init__(self):
+        super(ClippedLinearActivation, self).__init__()
 
-    df_res = pd.DataFrame(outer_fold_results)
+    def forward(self, x):
+        return torch.clamp(x, min=0, max=1)
 
-    cols = ['Fold'] + [c for c in df_res.columns if c != 'Fold']
-    df_res = df_res[cols]
+class CosineNegActivation(nn.Module):
+    def __init__(self):
+        super(CosineNegActivation, self).__init__()
+    def forward(self, x):
+        # print('xxx', x)
+        # if x<=0 or x>=1:
+        #     return torch.clamp(x, min=0, max=1)
+        # else:
+        return torch.where(x < 0, torch.tensor(0.0, device=x.device),
+                           torch.where(x > 1, torch.tensor(1.0, device=x.device),
+                                       (-torch.cos(math.pi * x) + 1) / 2))
 
-    mean_res = df_res.drop(columns=['Fold']).mean()
-    std_res = df_res.drop(columns=['Fold']).std()
+class SelfAttention(nn.Module):
+    def __init__(self, query_dim, return_dim, num_heads=1, dropout=0.15, encoder_with_res=True, residual_coef=1):
+        super(SelfAttention, self).__init__()
+        self.query_dim = query_dim
+        self.return_dim = return_dim
 
-    report_path = os.path.join(save_path, "Rigorous_10Fold_Summary.txt")
-    with open(report_path, 'w') as f:
-        f.write(f"========== ProtSATT {args.num_classes}-Class Performance ({args.sim_threshold}) ==========\n\n")
+        # Define the weights
+        self.WQ = nn.Parameter(torch.Tensor(query_dim, query_dim))
+        self.WK = nn.Parameter(torch.Tensor(query_dim, query_dim))
+        self.WV = nn.Parameter(torch.Tensor(query_dim, query_dim))
+        self.linear = nn.LazyLinear(return_dim) # 128
+        self.drop = nn.Dropout(dropout)
+        self.num_heads = num_heads
 
-        f.write("--- Fold Details ---\n")
-        f.write(df_res.to_string(index=False) + "\n\n")
+        self.init_weights()
+        self.encoder_with_res = encoder_with_res
+        self.residual_coef = residual_coef
+        self.LayerNorm = LayerNorm(query_dim, eps=1e-12)
+        self.swish = Swish()
 
-        f.write("--- Overall Average ---\n")
-        for metric in mean_res.index:
-            line = f"{metric:<15}: {mean_res[metric]:.4f} ± {std_res[metric]:.4f}\n"
-            print(line.strip())
-            f.write(line)
+    def init_weights(self):
+        nn.init.xavier_uniform_(self.WQ)
+        nn.init.xavier_uniform_(self.WK)
+        nn.init.xavier_uniform_(self.WV)
 
-    csv_path = os.path.join(save_path, "Rigorous_10Fold_Summary.csv")
-    df_res.to_csv(csv_path, index=False)
+    def forward(self, x):
+        # print('========',x.shape)
+        batch_size, seq_length, _ = x.size()
 
-    print(f"\n✅ saved: {save_path}")
+        # Linear projections
+        Q = torch.matmul(x, self.WQ).view(batch_size, seq_length, self.num_heads, self.query_dim // self.num_heads)
+        K = torch.matmul(x, self.WK).view(batch_size, seq_length, self.num_heads, self.query_dim // self.num_heads)
+        V = torch.matmul(x, self.WV).view(batch_size, seq_length, self.num_heads, self.query_dim // self.num_heads)
 
-if __name__ == "__main__":
-    main()
+        Q = Q.permute(0, 2, 1, 3)
+        K = K.permute(0, 2, 1, 3)
+        V = V.permute(0, 2, 1, 3)
+
+        # Scaled Dot-Product Attention
+        QK = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.query_dim // self.num_heads)
+        # QK = F.softmax(QK, dim=-1)
+        QK = self.swish(QK)
+
+        output = torch.matmul(QK, V).permute(0, 2, 1, 3).contiguous().view(batch_size, seq_length, self.query_dim)
+        # print('===============', output.shape)
+
+        # # Apply dropout if specified
+        # if self.dropout:
+        #     output = self.dropout(output)
+
+        # # Apply normalization if specified
+        # if self.encoder_norm:
+        #     output = self.encoder_norm(output)
+
+        # # Add residual connection if specified
+        if self.encoder_with_res:
+            output = self.LayerNorm(output + self.residual_coef * x)
+
+        output = self.drop(self.linear(output.view(output.size(0), -1)))
+        return self.swish(output).view(output.size(0), -1, self.query_dim)
+
+class CrossAttention(nn.Module):
+    def __init__(self, query_dim, return_dim, num_heads=1, dropout=0.15, encoder_with_res=True, residual_coef=0.5):
+        super(CrossAttention, self).__init__()
+        self.query_dim = query_dim
+        self.return_dim = return_dim
+
+        # Define the weights
+        self.WQ = nn.Parameter(torch.Tensor(query_dim, query_dim))
+        self.WK = nn.Parameter(torch.Tensor(query_dim, query_dim))
+        self.WV = nn.Parameter(torch.Tensor(query_dim, query_dim))
+        self.linear = nn.LazyLinear(return_dim)
+        self.drop = nn.Dropout(dropout)
+        self.num_heads = num_heads
+
+        self.init_weights()
+        self.encoder_with_res = encoder_with_res
+        self.residual_coef = residual_coef
+        self.LayerNorm = LayerNorm(query_dim, eps=1e-12)
+        self.swish = Swish()
+
+    def init_weights(self):
+        nn.init.xavier_uniform_(self.WQ)
+        nn.init.xavier_uniform_(self.WK)
+        nn.init.xavier_uniform_(self.WV)
+
+    def forward(self, q, x):
+        batch_size, seq_length, _ = x.size()
+
+        # Linear projections
+        Q = torch.matmul(q, self.WQ).view(batch_size, seq_length, self.num_heads, self.query_dim // self.num_heads)
+        K = torch.matmul(x, self.WK).view(batch_size, seq_length, self.num_heads, self.query_dim // self.num_heads)
+        V = torch.matmul(x, self.WV).view(batch_size, seq_length, self.num_heads, self.query_dim // self.num_heads)
+
+        Q = Q.permute(0, 2, 1, 3)
+        K = K.permute(0, 2, 1, 3)
+        V = V.permute(0, 2, 1, 3)
+
+        # Scaled Dot-Product Attention
+        QK = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.query_dim // self.num_heads)
+        QK = F.softmax(QK, dim=-1)
+        # QK = self.swish(QK)
+
+        output = torch.matmul(QK, V).permute(0, 2, 1, 3).contiguous().view(batch_size, seq_length, self.query_dim)
+        # # Add residual connection if specified
+        if self.encoder_with_res:
+            output = self.LayerNorm(output + self.residual_coef * x)
+        output = self.drop(self.linear(output.view(output.size(0), -1)))
+        return self.swish(output)
+
+class ProtSATT(nn.Module):
+    def __init__(
+            self,
+            *,
+            dropout,
+            first_self_query_dim=32, first_self_return_dim=512, first_self_num_head=1, first_self_dropout=0.15, first_self_encoder_with_res=True, first_self_residual_coef=1,
+            self_deep=1,
+            deep_self_query_dim=16, deep_self_return_dim=128, deep_self_num_head=1, deep_self_dropout=0.15, deep_self_encoder_with_res=True, deep_self_residual_coef=1,
+            deep_cross_query_dim=8, deep_cross_return_dim=32, deep_cross_num_head=1, deep_cross_dropout=0.15, deep_cross_encoder_with_res=True, deep_cross_residual_coef=0.5,
+            out_scores=2,
+            **kwargs
+    ):
+        super().__init__()
+        self.dropout_emb = nn.Dropout(p=dropout)
+        self.input1 = nn.LazyLinear(1024)
+        self.input2 = nn.LazyLinear(1024)
+        self.input3 = nn.LazyLinear(1024)
+        self.selfAttentionInput1 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+        self.selfAttentionInput2 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+        self.selfAttentionInput3 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+
+        self_atten_layer1 = []
+        self_atten_layer2 = []
+        self_atten_layer3 = []
+        for i in range(self_deep):
+            self_atten_layer1.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+            self_atten_layer2.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+            self_atten_layer3.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+        self.self_atten_tower1 = nn.Sequential(*self_atten_layer1)
+        self.self_atten_tower2 = nn.Sequential(*self_atten_layer2)
+        self.self_atten_tower3 = nn.Sequential(*self_atten_layer3)
+
+        self.cross_atten_tower1 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower2 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower3 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower4 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower5 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower6 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.swish = Swish()
+        # self.swish = ClippedLinearActivation()
+        self.cos = CosineNegActivation()
+        self.dense_out = nn.LazyLinear(16)
+        self.to_score = nn.Linear(16, out_scores)
+
+    def forward(self, x_embed1, x_embed2, x_embed3, device, first_self_query_dim=32, deep_self=True, deep_self_query_dim=16, deep_cross_query_dim=8, return_features=False):
+        # 1280 1024 1900
+        n1 = x_embed1.shape[1]
+        # [batch, 1900]
+        x1 = self.dropout_emb(x_embed1)
+        pos_emb1 = max_standardization(torch.arange(n1))
+        pos_emb1 = pos_emb1.to(device)
+        x1 = x1 + pos_emb1
+
+        # queries
+        n2 = x_embed2.shape[1]
+        # [batch, 1900]
+        x2 = self.dropout_emb(x_embed2)
+        pos_emb2 = max_standardization(torch.arange(n2))
+        pos_emb2 = pos_emb2.to(device)
+        x2 = x2 + pos_emb2
+
+        # queries
+        n3 = x_embed3.shape[1]
+        # [batch, 1900]
+        x3 = self.dropout_emb(x_embed3)
+        pos_emb3 = max_standardization(torch.arange(n3))
+        pos_emb3 = pos_emb3.to(device)
+        x3 = x3 + pos_emb3
+
+        # first self
+        x1 = self.input1(x1).view(x1.shape[0], -1, first_self_query_dim)
+        x2 = self.input2(x2).view(x2.shape[0], -1, first_self_query_dim)
+        x3 = self.input3(x3).view(x3.shape[0], -1, first_self_query_dim)
+        # self_flatten
+        atten_state1 = self.selfAttentionInput1(x1).view(x1.shape[0], -1)
+        atten_state2 = self.selfAttentionInput2(x2).view(x2.shape[0], -1)
+        atten_state3 = self.selfAttentionInput3(x3).view(x3.shape[0], -1)
+
+        # deep self
+        if deep_self:
+            atten_state1 = atten_state1.view(atten_state1.shape[0], -1, deep_self_query_dim)
+            atten_state2 = atten_state2.view(atten_state2.shape[0], -1, deep_self_query_dim)
+            atten_state3 = atten_state3.view(atten_state3.shape[0], -1, deep_self_query_dim)
+            atten_state1 = self.self_atten_tower1(atten_state1)
+            atten_state2 = self.self_atten_tower2(atten_state2)
+            atten_state3 = self.self_atten_tower3(atten_state3)
+
+        # cross
+        atten_state1 = atten_state1.view(atten_state1.shape[0], -1, 8)
+        atten_state2 = atten_state2.view(atten_state2.shape[0], -1, 8)
+        atten_state3 = atten_state3.view(atten_state3.shape[0], -1, 8)
+        atten_state_tower1 = atten_state1
+        atten_state_tower2 = atten_state1
+        atten_state_tower3 = atten_state2
+        atten_state_tower4 = atten_state2
+        atten_state_tower5 = atten_state3
+        atten_state_tower6 = atten_state3
+
+        for layer in self.cross_atten_tower1:
+            atten_state_tower1 = layer(atten_state_tower1, atten_state2)
+        for layer in self.cross_atten_tower2:
+            atten_state_tower2 = layer(atten_state_tower2, atten_state3)
+        for layer in self.cross_atten_tower3:
+            atten_state_tower3 = layer(atten_state_tower3, atten_state1)
+        for layer in self.cross_atten_tower4:
+            atten_state_tower4 = layer(atten_state_tower4, atten_state3)
+        for layer in self.cross_atten_tower5:
+            atten_state_tower5 = layer(atten_state_tower5, atten_state1)
+        for layer in self.cross_atten_tower6:
+            atten_state_tower6 = layer(atten_state_tower6, atten_state2)
+
+        intermediate = torch.cat((atten_state_tower1,atten_state_tower2,atten_state_tower3,atten_state_tower4,atten_state_tower5,atten_state_tower6),1)
+
+        features = self.cos(self.dense_out(self.swish(intermediate)))
+
+        score = self.to_score(features)
+        if return_features:
+            # return score.squeeze(1), torch.cat((x_embed1,x_embed2,x_embed3),1)
+            return score.squeeze(1), intermediate
+        return score.squeeze(1)
+
+class multi_layer_attention_2input(nn.Module):
+    def __init__(
+            self,
+            *,
+            dropout,
+            first_self_query_dim=32, first_self_return_dim=512, first_self_num_head=1, first_self_dropout=0.15, first_self_encoder_with_res=True, first_self_residual_coef=1,
+            self_deep=1,
+            deep_self_query_dim=16, deep_self_return_dim=128, deep_self_num_head=1, deep_self_dropout=0.15, deep_self_encoder_with_res=True, deep_self_residual_coef=1,
+            deep_cross_query_dim=8, deep_cross_return_dim=32, deep_cross_num_head=1, deep_cross_dropout=0.15, deep_cross_encoder_with_res=True, deep_cross_residual_coef=0.5,
+            out_scores=2,
+            **kwargs
+    ):
+        super().__init__()
+        self.dropout_emb = nn.Dropout(p=dropout)
+        self.input1 = nn.LazyLinear(1024)
+        self.input2 = nn.LazyLinear(1024)
+        self.selfAttentionInput1 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+        self.selfAttentionInput2 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+
+        self_atten_layer1 = []
+        self_atten_layer2 = []
+        for i in range(self_deep):
+            self_atten_layer1.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+            self_atten_layer2.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+        self.self_atten_tower1 = nn.Sequential(*self_atten_layer1)
+        self.self_atten_tower2 = nn.Sequential(*self_atten_layer2)
+
+        self.cross_atten_tower1 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower2 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+
+        self.swish = Swish()
+        # self.swish = ClippedLinearActivation()
+        self.cos = CosineNegActivation()
+        self.dense_out = nn.LazyLinear(16)
+        self.to_score = nn.Linear(16, out_scores)
+
+    def forward(self, x_embed1, x_embed2, x_embed3, device, first_self_query_dim=32, deep_self=True, deep_self_query_dim=16, deep_cross_query_dim=8, return_intermediate=False):
+        n1 = x_embed1.shape[1]
+        # [batch, 1900]
+        x1 = self.dropout_emb(x_embed1)
+        # x1 = x_embed1
+        pos_emb1 = max_standardization(torch.arange(n1))
+        pos_emb1 = pos_emb1.to(device)
+        # torch.Size([1, 1900, 32])
+        x1 = x1 + pos_emb1
+
+        # queries
+        n2 = x_embed2.shape[1]
+        # [batch, 1900]
+        x2 = self.dropout_emb(x_embed2)
+        # x2 = x_embed2
+        pos_emb2 = max_standardization(torch.arange(n2))
+        pos_emb2 = pos_emb2.to(device)
+        # torch.Size([1, 1900, 32])
+        # pos_emb = rearrange(pos_emb, 'n d -> () n d')
+        x2 = x2 + pos_emb2
+
+        x1 = self.input1(x1).view(x1.shape[0], -1, first_self_query_dim)
+        x2 = self.input2(x2).view(x2.shape[0], -1, first_self_query_dim)
+        # self_flatten
+        atten_state1 = self.selfAttentionInput1(x1).view(x1.shape[0], -1)
+        atten_state2 = self.selfAttentionInput2(x2).view(x2.shape[0], -1)
+
+        if deep_self:
+            atten_state1 = atten_state1.view(atten_state1.shape[0], -1, deep_self_query_dim)
+            atten_state2 = atten_state2.view(atten_state2.shape[0], -1, deep_self_query_dim)
+            atten_state1 = self.self_atten_tower1(atten_state1)
+            atten_state2 = self.self_atten_tower2(atten_state2)
+
+        atten_state1 = atten_state1.view(atten_state1.shape[0], -1, 8)
+        atten_state2 = atten_state2.view(atten_state2.shape[0], -1, 8)
+        atten_state_tower1 = atten_state1
+        atten_state_tower2 = atten_state2
+
+        for layer in self.cross_atten_tower1:
+            atten_state_tower1 = layer(atten_state_tower1, atten_state2)
+        for layer in self.cross_atten_tower2:
+            atten_state_tower2 = layer(atten_state_tower2, atten_state1)
+
+        intermediate = torch.cat((atten_state_tower1,atten_state_tower2),1)
+        if return_intermediate:
+            return intermediate
+
+        score = self.cos(self.dense_out(self.swish(intermediate)))
+
+        score = self.to_score(score)
+        return score.squeeze(1)
+
+class multi_layer_attention_1input(nn.Module):
+    def __init__(
+            self,
+            *,
+            dropout,
+            first_self_query_dim=32, first_self_return_dim=512, first_self_num_head=1, first_self_dropout=0.15, first_self_encoder_with_res=True, first_self_residual_coef=1,
+            self_deep=1,
+            deep_self_query_dim=16, deep_self_return_dim=128, deep_self_num_head=1, deep_self_dropout=0.15, deep_self_encoder_with_res=True, deep_self_residual_coef=1,
+            deep_cross_query_dim=8, deep_cross_return_dim=32, deep_cross_num_head=1, deep_cross_dropout=0.15, deep_cross_encoder_with_res=True, deep_cross_residual_coef=0.5,
+            out_scores=2,
+            **kwargs
+    ):
+        super().__init__()
+        self.dropout_emb = nn.Dropout(p=dropout)
+        self.input1 = nn.LazyLinear(1024)
+        self.selfAttentionInput1 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+
+        self_atten_layer1 = []
+        for i in range(self_deep):
+            self_atten_layer1.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+        self.self_atten_tower1 = nn.Sequential(*self_atten_layer1)
+
+        self.swish = Swish()
+        # self.swish = ClippedLinearActivation()
+        self.cos = CosineNegActivation()
+        self.dense_out = nn.LazyLinear(16)
+        self.to_score = nn.Linear(16, out_scores)
+
+    def forward(self, x_embed1, x_embed2, x_embed3, device, first_self_query_dim=32, deep_self=True, deep_self_query_dim=16, deep_cross_query_dim=8, return_intermediate=False):
+        n1 = x_embed1.shape[1]
+        # [batch, 1900]
+        x1 = self.dropout_emb(x_embed1)
+        # x1 = x_embed1
+        pos_emb1 = max_standardization(torch.arange(n1))
+        pos_emb1 = pos_emb1.to(device)
+        x1 = x1 + pos_emb1
+
+        x1 = self.input1(x1).view(x1.shape[0], -1, first_self_query_dim)
+        # self_flatten
+        atten_state1 = self.selfAttentionInput1(x1).view(x1.shape[0], -1)
+
+        if deep_self:
+            atten_state1 = atten_state1.view(atten_state1.shape[0], -1, deep_self_query_dim)
+            atten_state1 = self.self_atten_tower1(atten_state1)
+
+        intermediate = atten_state1
+
+        if return_intermediate:
+            return intermediate
+
+        score = self.cos(self.dense_out(self.swish(intermediate)))
+        score = self.to_score(score)
+        return score.squeeze(1)
+
+
+class multi_layer_attention_no_self(nn.Module):
+    def __init__(
+            self,
+            *,
+            dropout,
+            first_self_query_dim=32, first_self_return_dim=512, first_self_num_head=1, first_self_dropout=0.15, first_self_encoder_with_res=True, first_self_residual_coef=1,
+            self_deep=1,
+            deep_self_query_dim=16, deep_self_return_dim=128, deep_self_num_head=1, deep_self_dropout=0.15, deep_self_encoder_with_res=True, deep_self_residual_coef=1,
+            deep_cross_query_dim=8, deep_cross_return_dim=32, deep_cross_num_head=1, deep_cross_dropout=0.15, deep_cross_encoder_with_res=True, deep_cross_residual_coef=0.5,
+            out_scores=2,
+            **kwargs
+    ):
+        super().__init__()
+        self.dropout_emb = nn.Dropout(p=dropout)
+        self.input1 = nn.LazyLinear(1024)
+        self.input2 = nn.LazyLinear(1024)
+        self.input3 = nn.LazyLinear(1024)
+        self.selfAttentionInput1 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+        self.selfAttentionInput2 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+        self.selfAttentionInput3 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+
+        self_atten_layer1 = []
+        self_atten_layer2 = []
+        self_atten_layer3 = []
+        for i in range(self_deep):
+            self_atten_layer1.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+            self_atten_layer2.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+            self_atten_layer3.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+        self.self_atten_tower1 = nn.Sequential(*self_atten_layer1)
+        self.self_atten_tower2 = nn.Sequential(*self_atten_layer2)
+        self.self_atten_tower3 = nn.Sequential(*self_atten_layer3)
+
+        self.cross_atten_tower1 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower2 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower3 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower4 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower5 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower6 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.swish = Swish()
+        # self.swish = ClippedLinearActivation()
+        self.cos = CosineNegActivation()
+        self.dense_out = nn.LazyLinear(16)
+        self.to_score = nn.Linear(16, out_scores)
+
+    def forward(self, x_embed1, x_embed2, x_embed3, device, first_self_query_dim=32, deep_self=True, deep_self_query_dim=16, deep_cross_query_dim=8, return_intermediate=False):
+        n1 = x_embed1.shape[1]
+        # [batch, 1900]
+        x1 = self.dropout_emb(x_embed1)
+        pos_emb1 = max_standardization(torch.arange(n1))
+        pos_emb1 = pos_emb1.to(device)
+        x1 = x1 + pos_emb1
+
+        # queries
+        n2 = x_embed2.shape[1]
+        # [batch, 1900]
+        x2 = self.dropout_emb(x_embed2)
+        pos_emb2 = max_standardization(torch.arange(n2))
+        pos_emb2 = pos_emb2.to(device)
+        x2 = x2 + pos_emb2
+
+        # queries
+        n3 = x_embed3.shape[1]
+        # [batch, 1900]
+        x3 = self.dropout_emb(x_embed3)
+        pos_emb3 = max_standardization(torch.arange(n3))
+        pos_emb3 = pos_emb3.to(device)
+        x3 = x3 + pos_emb3
+
+        atten_state1 = self.input1(x1).view(x1.shape[0], -1, 8)
+        atten_state2 = self.input2(x2).view(x2.shape[0], -1, 8)
+        atten_state3 = self.input3(x3).view(x3.shape[0], -1, 8)
+        atten_state_tower1 = atten_state1
+        atten_state_tower2 = atten_state1
+        atten_state_tower3 = atten_state2
+        atten_state_tower4 = atten_state2
+        atten_state_tower5 = atten_state3
+        atten_state_tower6 = atten_state3
+
+        for layer in self.cross_atten_tower1:
+            atten_state_tower1 = layer(atten_state_tower1, atten_state2)
+        for layer in self.cross_atten_tower2:
+            atten_state_tower2 = layer(atten_state_tower2, atten_state3)
+        for layer in self.cross_atten_tower3:
+            atten_state_tower3 = layer(atten_state_tower3, atten_state1)
+        for layer in self.cross_atten_tower4:
+            atten_state_tower4 = layer(atten_state_tower4, atten_state3)
+        for layer in self.cross_atten_tower5:
+            atten_state_tower5 = layer(atten_state_tower5, atten_state1)
+        for layer in self.cross_atten_tower6:
+            atten_state_tower6 = layer(atten_state_tower6, atten_state2)
+
+        intermediate = torch.cat((atten_state_tower1,atten_state_tower2,atten_state_tower3,atten_state_tower4,atten_state_tower5,atten_state_tower6),1)
+        if return_intermediate:
+            return intermediate
+
+        score = self.cos(self.dense_out(self.swish(intermediate)))
+        score = self.to_score(score)
+        return score.squeeze(1)
+
+class multi_layer_attention_no_cross(nn.Module):
+    def __init__(
+            self,
+            *,
+            dropout,
+            first_self_query_dim=32, first_self_return_dim=512, first_self_num_head=1, first_self_dropout=0.15, first_self_encoder_with_res=True, first_self_residual_coef=1,
+            self_deep=1,
+            deep_self_query_dim=16, deep_self_return_dim=128, deep_self_num_head=1, deep_self_dropout=0.15, deep_self_encoder_with_res=True, deep_self_residual_coef=1,
+            deep_cross_query_dim=8, deep_cross_return_dim=32, deep_cross_num_head=1, deep_cross_dropout=0.15, deep_cross_encoder_with_res=True, deep_cross_residual_coef=0.5,
+            out_scores=2,
+            **kwargs
+    ):
+        super().__init__()
+        self.dropout_emb = nn.Dropout(p=dropout)
+        self.input1 = nn.LazyLinear(1024)
+        self.input2 = nn.LazyLinear(1024)
+        self.input3 = nn.LazyLinear(1024)
+        self.selfAttentionInput1 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+        self.selfAttentionInput2 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+        self.selfAttentionInput3 = SelfAttention(query_dim=first_self_query_dim, return_dim=first_self_return_dim, num_heads=first_self_num_head, dropout=first_self_dropout, encoder_with_res=first_self_encoder_with_res, residual_coef=first_self_residual_coef)
+
+        self_atten_layer1 = []
+        self_atten_layer2 = []
+        self_atten_layer3 = []
+        for i in range(self_deep):
+            self_atten_layer1.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+            self_atten_layer2.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+            self_atten_layer3.append(nn.Sequential(SelfAttention(query_dim=deep_self_query_dim, return_dim = deep_self_return_dim, num_heads=deep_self_num_head, dropout=deep_self_dropout, encoder_with_res=deep_self_encoder_with_res, residual_coef=deep_self_residual_coef)))
+        self.self_atten_tower1 = nn.Sequential(*self_atten_layer1)
+        self.self_atten_tower2 = nn.Sequential(*self_atten_layer2)
+        self.self_atten_tower3 = nn.Sequential(*self_atten_layer3)
+
+        self.cross_atten_tower1 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower2 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower3 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower4 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower5 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.cross_atten_tower6 = nn.ModuleList([CrossAttention(query_dim=deep_cross_query_dim, return_dim=deep_cross_return_dim, num_heads=deep_cross_num_head, dropout=deep_cross_dropout, encoder_with_res=deep_cross_encoder_with_res, residual_coef=deep_cross_residual_coef) for _ in range(1)])
+        self.swish = Swish()
+        # self.swish = ClippedLinearActivation()
+        self.cos = CosineNegActivation()
+        self.dense_out = nn.LazyLinear(16)
+        self.to_score = nn.Linear(16, out_scores)
+
+    def forward(self, x_embed1, x_embed2, x_embed3, device, first_self_query_dim=32, deep_self=True, deep_self_query_dim=16, deep_cross_query_dim=8, return_intermediate=False):
+        n1 = x_embed1.shape[1]
+        # [batch, 1900]
+        x1 = self.dropout_emb(x_embed1)
+        pos_emb1 = max_standardization(torch.arange(n1))
+        pos_emb1 = pos_emb1.to(device)
+        x1 = x1 + pos_emb1
+
+        # queries
+        n2 = x_embed2.shape[1]
+        # [batch, 1900]
+        x2 = self.dropout_emb(x_embed2)
+        pos_emb2 = max_standardization(torch.arange(n2))
+        pos_emb2 = pos_emb2.to(device)
+        x2 = x2 + pos_emb2
+
+        # queries
+        n3 = x_embed3.shape[1]
+        # [batch, 1900]
+        x3 = self.dropout_emb(x_embed3)
+        pos_emb3 = max_standardization(torch.arange(n3))
+        pos_emb3 = pos_emb3.to(device)
+        x3 = x3 + pos_emb3
+
+        x1 = self.input1(x1).view(x1.shape[0], -1, first_self_query_dim)
+        x2 = self.input2(x2).view(x2.shape[0], -1, first_self_query_dim)
+        x3 = self.input3(x3).view(x3.shape[0], -1, first_self_query_dim)
+        # self_flatten
+        atten_state1 = self.selfAttentionInput1(x1).view(x1.shape[0], -1)
+        atten_state2 = self.selfAttentionInput2(x2).view(x2.shape[0], -1)
+        atten_state3 = self.selfAttentionInput3(x3).view(x3.shape[0], -1)
+
+        if deep_self:
+            atten_state1 = atten_state1.view(atten_state1.shape[0], -1, deep_self_query_dim)
+            atten_state2 = atten_state2.view(atten_state2.shape[0], -1, deep_self_query_dim)
+            atten_state3 = atten_state3.view(atten_state3.shape[0], -1, deep_self_query_dim)
+            atten_state1 = self.self_atten_tower1(atten_state1)
+            atten_state2 = self.self_atten_tower2(atten_state2)
+            atten_state3 = self.self_atten_tower3(atten_state3)
+
+        atten_state1 = atten_state1.view(atten_state1.shape[0], -1)
+        atten_state2 = atten_state2.view(atten_state2.shape[0], -1)
+        atten_state3 = atten_state3.view(atten_state3.shape[0], -1)
+
+        intermediate = torch.cat((atten_state1, atten_state2, atten_state3),1)
+        if return_intermediate:
+            return intermediate
+
+        score = self.cos(self.dense_out(self.swish(intermediate)))
+        score = self.to_score(score)
+        return score.squeeze(1)
