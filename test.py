@@ -1,96 +1,106 @@
-# train.py
-# 三模态全局特征融合模型的 10-fold StratifiedGroupKFold 训练脚本
-# 数据表结构沿用原脚本：
-#   5ml_homology_clusters_unified_train.csv
-#   x_5ml_esm2_dataset_with_IDs.csv
-#   x_5ml_unirep_dataset_with_IDs.csv
-#   x_5ml_protT5_dataset_with_IDs.csv
-#
-# 特征 CSV：第一列为 Sequence_ID，后续列为浮点特征。
-# 聚类 CSV：至少包含 Sequence_ID 和 Sim_40（或 --sim_threshold 指定列）。
-# Sequence_ID 最后一个下划线后的数字必须是类别标签 0/1/2。
+weights = len(train_idx) / (args.num_classes * np.maximum(counts, 1))
+        weights = torch.tensor(weights, dtype=torch.float32, device=device)
+        criterion = nn.CrossEntropyLoss(weight=weights)
 
-import os
-import argparse
-import random
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import StratifiedGroupKFold
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    matthews_corrcoef, roc_auc_score, confusion_matrix,
-    classification_report
-)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=args.lr_factor,
+            patience=args.lr_patience, min_lr=args.min_lr
+        )
 
-from Model import GlobalFeatureFusion
+        best_f1 = -1.0
+        best_epoch = 0
+        wait = 0
+        ckpt_path = os.path.join(fold_dir, "best_model.pth")
+
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            running_loss = 0.0
+
+            for xe, xu, xp, y in train_loader:
+                xe, xu, xp, y = xe.to(device), xu.to(device), xp.to(device), y.to(device)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(xe, xu, xp)
+                loss = criterion(logits, y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                running_loss += loss.item() * y.size(0)
+
+            val_metrics = evaluate(model, val_loader, device)
+            scheduler.step(val_metrics["Macro_F1"])
+            lr_now = optimizer.param_groups[0]["lr"]
+
+            print(
+                f"Fold {fold} | Epoch {epoch:03d} | "
+                f"TrainLoss {running_loss / len(train_loader.dataset):.4f} | "
+                f"ValLoss {val_metrics['Loss']:.4f} | "
+                f"ValF1 {val_metrics['Macro_F1']:.4f} | "
+                f"ValAUC {val_metrics['Macro_ROC_AUC']:.4f} | "
+                f"ValMCC {val_metrics['MCC']:.4f} | LR {lr_now:.2e}"
+            )
+
+            if val_metrics["Macro_F1"] > best_f1:
+                best_f1 = val_metrics["Macro_F1"]
+                best_epoch = epoch
+                wait = 0
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "epoch": epoch,
+                        "val_metrics": val_metrics,
+                        "args": vars(args),
+                        "esm_dim": X_esm.shape[1],
+                        "unirep_dim": X_uni.shape[1],
+                        "prott5_dim": X_pro.shape[1],
+                    },
+                    ckpt_path,
+                )
+            else:
+                wait += 1
+
+            if wait >= args.patience:
+                print(f"Early stopping at epoch {epoch}; best epoch={best_epoch}, best val F1={best_f1:.4f}")
+                break
+
+        # 测试集只在该折模型选择完成后评估一次
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        test_metrics = evaluate(model, test_loader, device)
+
+        print(
+            f"Fold {fold} TEST | F1={test_metrics['Macro_F1']:.4f} | "
+            f"AUC={test_metrics['Macro_ROC_AUC']:.4f} | "
+            f"MCC={test_metrics['MCC']:.4f} | ACC={test_metrics['Accuracy']:.4f}"
+        )
+        print("Confusion matrix [[true0->pred0,1,2], ...]:", test_metrics["Confusion_Matrix"])
+
+        row = {k: v for k, v in test_metrics.items() if k not in ("Confusion_Matrix", "Class_Report")}
+        row["Fold"] = fold
+        row["Best_Epoch"] = best_epoch
+        fold_rows.append(row)
+
+        pd.DataFrame(test_metrics["Class_Report"]).T.to_csv(
+            os.path.join(fold_dir, "test_classification_report.csv")
+        )
+        with open(os.path.join(fold_dir, "test_metrics.txt"), "w") as f:
+            f.write(str(test_metrics))
+
+    result_df = pd.DataFrame(fold_rows)
+    result_df.to_csv(os.path.join(args.save_dir, "10fold_results.csv"), index=False)
+
+    numeric_cols = result_df.select_dtypes(include=[np.number]).columns.drop("Fold")
+    summary = pd.DataFrame({
+        "mean": result_df[numeric_cols].mean(),
+        "std": result_df[numeric_cols].std(),
+    })
+    summary.to_csv(os.path.join(args.save_dir, "10fold_summary.csv"))
+    print("\n===== 10-fold summary =====")
+    print(summary)
+    print("Results saved to:", args.save_dir)
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_dir", type=str,
-                   default="/data/caoying/softwares/ProtSATT/new_train/Expression/feature_train")
-    p.add_argument("--save_dir", type=str,
-                   default="/data/caoying/softwares/ProtSATT/new_train/Expression/result/global_fusion_3class")
-    p.add_argument("--sim_threshold", type=str, default="Sim_40")
-    p.add_argument("--num_classes", type=int, default=3)
-    p.add_argument("--epochs", type=int, default=300)
-    p.add_argument("--patience", type=int, default=80)
-    p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--dropout", type=float, default=0.20)
-    p.add_argument("--hidden_dim", type=int, default=256)
-    p.add_argument("--num_heads", type=int, default=4)
-    p.add_argument("--num_layers", type=int, default=1)
-    p.add_argument("--lr_patience", type=int, default=12)
-    p.add_argument("--lr_factor", type=float, default=0.5)
-    p.add_argument("--min_lr", type=float, default=1e-6)
-    p.add_argument("--seed", type=int, default=2025)
-    p.add_argument("--num_workers", type=int, default=4)
-    return p.parse_args()
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-class MultiFeatureDataset(Dataset):
-    def __init__(self, esm, uni, pro, labels):
-        self.esm = torch.as_tensor(esm, dtype=torch.float32)
-        self.uni = torch.as_tensor(uni, dtype=torch.float32)
-        self.pro = torch.as_tensor(pro, dtype=torch.float32)
-        self.labels = torch.as_tensor(labels, dtype=torch.long)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        return self.esm[idx], self.uni[idx], self.pro[idx], self.labels[idx]
-
-
-def load_features(path, target_ids):
-    # header=None：兼容原脚本无表头格式；第 1 列为 ID
-    df = pd.read_csv(path, header=None, low_memory=False)
-    df = df.rename(columns={0: "Sequence_ID"})
-    df["Sequence_ID"] = df["Sequence_ID"].astype(str)
-    if df["Sequence_ID"].duplicated().any():
-        duplicated = df.loc[df["Sequence_ID"].duplicated(), "Sequence_ID"].head().tolist()
-        raise ValueError(f"{os.path.basename(path)} 存在重复 Sequence_ID，例如：{duplicated}")
-
-    df = df.set_index("Sequence_ID")
-    missing = [sid for sid in target_ids if sid not in df.index]
-    if missing:
-        raise KeyError(f"{os.path.basename(path)} 缺少 {len(missing)} 个 ID，例如：{missing[:5]}")
-
-    arr = df.loc[target_ids].to_numpy(dtype=np.float32)
-    if not np.isfinite(arr).all():
-        raise ValueError(f"{path} 特征中存在 NaN 或 Inf")
+if __name__ == "__main__":
+    main()
