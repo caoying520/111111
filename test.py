@@ -44,16 +44,17 @@ class EnzymeSubstrateDataset(Dataset):
         """
         self.df = df.reset_index(drop=True)
         self.idx = df["Name"].astype(str).tolist()
-        self.smiles = df["SM"].tolist()
-        self.labels = df["Conv"].astype(float).tolist()
+        self.smiles1 = df["SM_胺"].tolist()
+        self.smiles2 = df["SM_酮"].tolist()
+        self.labels = df["Activity"].astype(float).tolist()
         self.esm_embeds = esm_embeds
         self.mol_embeds = mol_embeds
 
-        # 归一化后浓度列（log+zscore，在 main() 中计算）
-        if "SM_norm" not in df.columns or "Enz_norm" not in df.columns:
-            raise ValueError("DataFrame must contain 'SM_norm' and 'Enz_norm' columns.")
-        self.sm_norm = df["SM_norm"].astype(float).tolist()
-        self.enzyme_norm = df["Enz_norm"].astype(float).tolist()
+        # # 归一化后浓度列（log+zscore，在 main() 中计算）
+        # if "SM_norm" not in df.columns or "Enz_norm" not in df.columns:
+        #     raise ValueError("DataFrame must contain 'SM_norm' and 'Enz_norm' columns.")
+        # self.sm_norm = df["SM_norm"].astype(float).tolist()
+        # self.enzyme_norm = df["Enz_norm"].astype(float).tolist()
 
     def __len__(self):
         return len(self.df)
@@ -63,11 +64,12 @@ class EnzymeSubstrateDataset(Dataset):
         esm_data = self.esm_embeds[idx]  # {"emb": tensor, "mask": tensor}
         esm_emb = esm_data["emb"].float()    # e.g. [L, d]
         esm_mask = esm_data["mask"].long()   # e.g. [L]
-        mol_feat = torch.tensor(self.mol_embeds[self.smiles[i]], dtype=torch.float32)
+        mol_feat1 = torch.tensor(self.mol_embeds[self.smiles1[i]], dtype=torch.float32)
+        mol_feat2 = torch.tensor(self.mol_embeds[self.smiles2[i]], dtype=torch.float32)
 
-        # 浓度：归一化后的标量，保持 shape [1]
-        sm_load = torch.tensor([self.sm_norm[i]], dtype=torch.float32)
-        enz_load = torch.tensor([self.enzyme_norm[i]], dtype=torch.float32)
+        # # 浓度：归一化后的标量，保持 shape [1]
+        # sm_load = torch.tensor([self.sm_norm[i]], dtype=torch.float32)
+        # enz_load = torch.tensor([self.enzyme_norm[i]], dtype=torch.float32)
 
         label = torch.tensor(self.labels[i], dtype=torch.float32)
         return esm_emb, esm_mask, mol_feat, sm_load, enz_load, label
@@ -86,7 +88,14 @@ class EnzymeSubstrateRegressor(nn.Module):
             nn.Linear(512, 256),
         )
         # Mol projection: mol_dim -> 256
-        self.mol_proj = nn.Sequential(
+        self.mol_proj1 = nn.Sequential(
+            nn.Linear(mol_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+        )
+
+        self.mol_proj2 = nn.Sequential(
             nn.Linear(mol_dim, 512),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -99,22 +108,23 @@ class EnzymeSubstrateRegressor(nn.Module):
         )
         self.esm_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-        # 浓度投影：1 -> 64 -> 128（分别为 SM 和 Enzyme）
-        self.sm_proj = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.LayerNorm(128)
-        )
-        self.enz_proj = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.LayerNorm(128)
-        )
+        # # 浓度投影：1 -> 64 -> 128（分别为 SM 和 Enzyme）
+        # self.sm_proj = nn.Sequential(
+        #     nn.Linear(1, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, 128),
+        #     nn.LayerNorm(128)
+        # )
+        # self.enz_proj = nn.Sequential(
+        #     nn.Linear(1, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, 128),
+        #     nn.LayerNorm(128)
+        # )
 
         # 全连接层：输入维度 256 + 256 + 128 + 128 = 768
-        input_dim = 256 + 256 + 128 + 128
+        # input_dim = 256 + 256 + 128 + 128
+        input_dim = 256 + 256 + 256
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -145,14 +155,17 @@ class EnzymeSubstrateRegressor(nn.Module):
         esm_pooled = (esm_feat * mask_expanded).sum(dim=1) / denom  # [B, 256]
 
         # Mol projection
-        mol_proj = self.mol_proj(mol_feat)  # [B, 256]
+        mol_proj1 = self.mol_proj1(mol_feat1)  # [B, 256]
+        mol_proj2 = self.mol_proj2(mol_feat2)  # [B, 256]
 
-        # Concentration projections
-        sm_proj = self.sm_proj(sm_load)   # [B, 128]
-        enz_proj = self.enz_proj(enz_load)  # [B, 128]
+        # # Concentration projections
+        # sm_proj = self.sm_proj(sm_load)   # [B, 128]
+        # enz_proj = self.enz_proj(enz_load)  # [B, 128]
 
         # Concat all
-        x = torch.cat([esm_pooled, enz_proj, mol_proj, sm_proj], dim=-1)  # [B, 768]
+        # x = torch.cat([esm_pooled, enz_proj, mol_proj, sm_proj], dim=-1)  # [B, 768]
+
+        x = torch.cat([esm_pooled, mol_proj1, mol_proj2], dim=-1)  # [B, 768 + 256 + 256]
 
         # FC blocks with residual
         x = F.relu(self.bn1(self.fc1(x)))
@@ -172,15 +185,18 @@ def evaluate(model, loader, device, criterion=None):
     preds, trues = [], []
     total_loss = 0.0
     with torch.no_grad():
-        for esm_feat, esm_mask, mol_feat, sm_load, enz_load, y in loader:
+        # for esm_feat, esm_mask, mol_feat, sm_load, enz_load, y in loader:
+        for esm_feat, esm_mask, mol_feat1, mol_feat2, y in loader:
             esm_feat = esm_feat.to(device)
             esm_mask = esm_mask.to(device)
-            mol_feat = mol_feat.to(device)
-            sm_load = sm_load.to(device)
-            enz_load = enz_load.to(device)
+            mol_feat1 = mol_feat1.to(device)
+            mol_feat2 = mol_feat2.to(device)
+            # sm_load = sm_load.to(device)
+            # enz_load = enz_load.to(device)
             y = y.to(device)
 
-            outputs = model(esm_feat, esm_mask, mol_feat, sm_load, enz_load)
+            #outputs = model(esm_feat, esm_mask, mol_feat, sm_load, enz_load)
+            outputs = model(esm_feat, esm_mask, mol_feat1, mol_feat2)
             preds.extend(outputs.cpu().numpy().tolist())
             trues.extend(y.cpu().numpy().tolist())
             if criterion is not None:
@@ -210,15 +226,17 @@ def train_model(train_loader, val_loader, model, optimizer, criterion, device, e
         model.train()
         total_loss = 0.0
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", ncols=100)
-        for esm_feat, esm_mask, mol_feat, sm_load, enz_load, y in loop:
+        # for esm_feat, esm_mask, mol_feat, sm_load, enz_load, y in loop:
+        for esm_feat, esm_mask, mol_feat1, mol_feat2, y in loop:
             esm_feat = esm_feat.to(device)
             esm_mask = esm_mask.to(device)
-            mol_feat = mol_feat.to(device)
-            sm_load = sm_load.to(device)
-            enz_load = enz_load.to(device)
+            mol_feat1 = mol_feat1.to(device)
+            mol_feat2 = mol_feat2.to(device)
+            # sm_load = sm_load.to(device)
+            # enz_load = enz_load.to(device)
             y = y.to(device)
 
-            preds = model(esm_feat, esm_mask, mol_feat, sm_load, enz_load)
+            preds = model(esm_feat, esm_mask, mol_feat1, mol_feat2)
             loss = criterion(preds, y)
 
             optimizer.zero_grad()
@@ -296,26 +314,26 @@ def main():
     df_test = df[df["idx"].isin(test_idx)].reset_index(drop=True)
     print(f"📂 数据集大小: train={len(df_train)}, val={len(df_val)}, test={len(df_test)}")
 
-    SM_COL = "SM loading (g/L)"
-    ENZ_COL = "Enzyme loading (g/L)"
+    # SM_COL = "SM loading (g/L)"
+    # ENZ_COL = "Enzyme loading (g/L)"
 
-    for d in [df_train, df_val, df_test]:
-        d[SM_COL] = pd.to_numeric(d[SM_COL], errors="coerce").fillna(0.0).clip(lower=0.0)
-        d[ENZ_COL] = pd.to_numeric(d[ENZ_COL], errors="coerce").fillna(0.0).clip(lower=0.0)
-        d["SM_log"] = np.log1p(d[SM_COL].astype(float))
-        d["Enz_log"] = np.log1p(d[ENZ_COL].astype(float))
+    # for d in [df_train, df_val, df_test]:
+    #     d[SM_COL] = pd.to_numeric(d[SM_COL], errors="coerce").fillna(0.0).clip(lower=0.0)
+    #     d[ENZ_COL] = pd.to_numeric(d[ENZ_COL], errors="coerce").fillna(0.0).clip(lower=0.0)
+        # d["SM_log"] = np.log1p(d[SM_COL].astype(float))
+        # d["Enz_log"] = np.log1p(d[ENZ_COL].astype(float))
 
-    sm_mean = df_train["SM_log"].mean()
-    sm_std = df_train["SM_log"].std() + 1e-12
-    enz_mean = df_train["Enz_log"].mean()
-    enz_std = df_train["Enz_log"].std() + 1e-12
+    # sm_mean = df_train["SM_log"].mean()
+    # sm_std = df_train["SM_log"].std() + 1e-12
+    # enz_mean = df_train["Enz_log"].mean()
+    # enz_std = df_train["Enz_log"].std() + 1e-12
 
-    for d in [df_train, df_val, df_test]:
-        d["SM_norm"] = (d["SM_log"] - sm_mean) / sm_std
-        d["Enz_norm"] = (d["Enz_log"] - enz_mean) / enz_std
+    # for d in [df_train, df_val, df_test]:
+    #     d["SM_norm"] = (d["SM_log"] - sm_mean) / sm_std
+    #     d["Enz_norm"] = (d["Enz_log"] - enz_mean) / enz_std
 
-    print("SM_log mean/std (train):", sm_mean, sm_std)
-    print("Enz_log mean/std (train):", enz_mean, enz_std)
+    # print("SM_log mean/std (train):", sm_mean, sm_std)
+    # print("Enz_log mean/std (train):", enz_mean, enz_std)
 
     # ---------- Dataset & DataLoader ----------
     train_set = EnzymeSubstrateDataset(df_train, esm_dict, mol_dict)
