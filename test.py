@@ -2,221 +2,198 @@ nohup: ignoring input
 Using device: cuda
 ✅ 已加载 ESM 特征: 165 条 | MolFormer 特征: 23 条 | MolFormer 特征: 12 条
 Loaded df: (17470, 8)
-📂 数据集大小: train=12092, val=2619, test=2759
-Positive weight: 3.9355102040816328
+📂 Enzyme-group split: train=12257, val=2607, test=2606
+🧬 Unique enzymes: train=125, val=20, test=20
+train: n=12257, active=2446, inactive=9811, active_ratio=0.1996
+val: n=2607, active=514, inactive=2093, active_ratio=0.1972
+test: n=2606, active=534, inactive=2072, active_ratio=0.2049
+Positive weight (sqrt ratio): 2.002757706286495
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 1/500 | Train Loss=1.0323 (cls=0.8237, reg=0.2087) | Val Loss=0.8447 | Val F1=0.6218 | Val PR-AUC=0.7214 | Val MAE=0.2976 | Active MAE=1.2225 | Active R2=-0.0085
-保存最佳模型！
+Epoch 1/200 | Train Loss=0.9680 (cls=0.6580, reg=0.2119, rank=0.6542) | Val Loss=0.7264 | F1=0.6613 | PR-AUC=0.6249 | Active Spearman=0.5737 | Top100 NDCG=0.5180 | Selection=0.6120 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 2/500 | Train Loss=0.8087 (cls=0.6608, reg=0.1479) | Val Loss=0.7373 | Val F1=0.6270 | Val PR-AUC=0.7306 | Val MAE=0.3182 | Active MAE=1.1679 | Active R2=0.1530
-保存最佳模型！
+Epoch 2/200 | Train Loss=0.7633 (cls=0.4939, reg=0.1771, rank=0.6156) | Val Loss=0.6879 | F1=0.6689 | PR-AUC=0.6759 | Active Spearman=0.6023 | Top100 NDCG=0.4626 | Selection=0.6006 | LR=1.00e-04
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 3/500 | Train Loss=0.7440 (cls=0.6078, reg=0.1361) | Val Loss=0.7060 | Val F1=0.6599 | Val PR-AUC=0.7335 | Val MAE=0.3408 | Active MAE=1.2837 | Active R2=0.1393
-保存最佳模型！
+Epoch 3/200 | Train Loss=0.7131 (cls=0.4622, reg=0.1603, rank=0.6043) | Val Loss=0.6494 | F1=0.6667 | PR-AUC=0.6798 | Active Spearman=0.5952 | Top100 NDCG=0.4959 | Selection=0.6173 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 4/500 | Train Loss=0.6964 (cls=0.5737, reg=0.1227) | Val Loss=0.6983 | Val F1=0.6682 | Val PR-AUC=0.7222 | Val MAE=0.2860 | Active MAE=1.1664 | Active R2=0.0675
-保存最佳模型！
+Epoch 4/200 | Train Loss=0.6821 (cls=0.4429, reg=0.1502, rank=0.5931) | Val Loss=0.6464 | F1=0.6755 | PR-AUC=0.7030 | Active Spearman=0.6085 | Top100 NDCG=0.5005 | Selection=0.6271 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 5/500 | Train Loss=0.6435 (cls=0.5397, reg=0.1038) | Val Loss=0.7319 | Val F1=0.7008 | Val PR-AUC=0.7347 | Val MAE=0.3038 | Active MAE=1.2363 | Active R2=0.0858
+Epoch 5/200 | Train Loss=0.6646 (cls=0.4338, reg=0.1435, rank=0.5819) | Val Loss=0.6408 | F1=0.6647 | PR-AUC=0.7230 | Active Spearman=0.6006 | Top100 NDCG=0.5056 | Selection=0.6336 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 6/500 | Train Loss=0.6117 (cls=0.5101, reg=0.1016) | Val Loss=0.9523 | Val F1=0.6340 | Val PR-AUC=0.6750 | Val MAE=0.2834 | Active MAE=1.3104 | Active R2=-0.0846
+Epoch 6/200 | Train Loss=0.6437 (cls=0.4261, reg=0.1312, rank=0.5757) | Val Loss=0.6303 | F1=0.6783 | PR-AUC=0.7191 | Active Spearman=0.6081 | Top100 NDCG=0.5405 | Selection=0.6510 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 7/500 | Train Loss=0.5909 (cls=0.4921, reg=0.0988) | Val Loss=0.8248 | Val F1=0.6806 | Val PR-AUC=0.6917 | Val MAE=0.2845 | Active MAE=1.2671 | Active R2=-0.0284
+Epoch 7/200 | Train Loss=0.6315 (cls=0.4176, reg=0.1286, rank=0.5689) | Val Loss=0.6732 | F1=0.6686 | PR-AUC=0.7364 | Active Spearman=0.6070 | Top100 NDCG=0.5307 | Selection=0.6503 | LR=1.00e-04
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 8/500 | Train Loss=0.5630 (cls=0.4671, reg=0.0959) | Val Loss=0.8121 | Val F1=0.6437 | Val PR-AUC=0.6766 | Val MAE=0.2857 | Active MAE=1.2889 | Active R2=0.0491
+Epoch 8/200 | Train Loss=0.6232 (cls=0.4125, reg=0.1260, rank=0.5643) | Val Loss=0.6323 | F1=0.6757 | PR-AUC=0.7417 | Active Spearman=0.6132 | Top100 NDCG=0.5396 | Selection=0.6569 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 9/500 | Train Loss=0.5444 (cls=0.4525, reg=0.0919) | Val Loss=1.0318 | Val F1=0.6038 | Val PR-AUC=0.6935 | Val MAE=0.2923 | Active MAE=1.3610 | Active R2=-0.1338
+Epoch 9/200 | Train Loss=0.6128 (cls=0.4070, reg=0.1217, rank=0.5598) | Val Loss=0.6145 | F1=0.6742 | PR-AUC=0.7426 | Active Spearman=0.6086 | Top100 NDCG=0.5463 | Selection=0.6599 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 10/500 | Train Loss=0.5186 (cls=0.4305, reg=0.0881) | Val Loss=1.1072 | Val F1=0.5837 | Val PR-AUC=0.6222 | Val MAE=0.2789 | Active MAE=1.2497 | Active R2=0.0470
+Epoch 10/200 | Train Loss=0.5963 (cls=0.3991, reg=0.1144, rank=0.5520) | Val Loss=0.6314 | F1=0.7098 | PR-AUC=0.7443 | Active Spearman=0.5999 | Top100 NDCG=0.5527 | Selection=0.6624 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 11/500 | Train Loss=0.5031 (cls=0.4176, reg=0.0855) | Val Loss=0.7003 | Val F1=0.6986 | Val PR-AUC=0.7348 | Val MAE=0.2686 | Active MAE=1.2154 | Active R2=0.0454
+Epoch 11/200 | Train Loss=0.5925 (cls=0.3990, reg=0.1103, rank=0.5544) | Val Loss=0.6414 | F1=0.7039 | PR-AUC=0.7380 | Active Spearman=0.6111 | Top100 NDCG=0.5625 | Selection=0.6671 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 12/500 | Train Loss=0.4906 (cls=0.4076, reg=0.0830) | Val Loss=0.8871 | Val F1=0.6680 | Val PR-AUC=0.6704 | Val MAE=0.2778 | Active MAE=1.2908 | Active R2=-0.0292
+Epoch 12/200 | Train Loss=0.5890 (cls=0.3942, reg=0.1117, rank=0.5537) | Val Loss=0.6170 | F1=0.7032 | PR-AUC=0.7465 | Active Spearman=0.6153 | Top100 NDCG=0.5598 | Selection=0.6684 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 13/500 | Train Loss=0.4720 (cls=0.3914, reg=0.0805) | Val Loss=0.6393 | Val F1=0.7078 | Val PR-AUC=0.7588 | Val MAE=0.2926 | Active MAE=1.2084 | Active R2=0.1246
-保存最佳模型！
+Epoch 13/200 | Train Loss=0.5712 (cls=0.3833, reg=0.1059, rank=0.5465) | Val Loss=0.6138 | F1=0.7115 | PR-AUC=0.7431 | Active Spearman=0.6157 | Top100 NDCG=0.5545 | Selection=0.6650 | LR=1.00e-04
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 14/500 | Train Loss=0.4530 (cls=0.3735, reg=0.0795) | Val Loss=0.7679 | Val F1=0.6471 | Val PR-AUC=0.7070 | Val MAE=0.3979 | Active MAE=1.5543 | Active R2=-0.0425
+Epoch 14/200 | Train Loss=0.5756 (cls=0.3816, reg=0.1117, rank=0.5490) | Val Loss=0.6081 | F1=0.7106 | PR-AUC=0.7634 | Active Spearman=0.6093 | Top100 NDCG=0.5652 | Selection=0.6746 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 15/500 | Train Loss=0.4467 (cls=0.3739, reg=0.0728) | Val Loss=0.6975 | Val F1=0.6874 | Val PR-AUC=0.7119 | Val MAE=0.3002 | Active MAE=1.1965 | Active R2=0.0489
+Epoch 15/200 | Train Loss=0.5675 (cls=0.3816, reg=0.1043, rank=0.5433) | Val Loss=0.6139 | F1=0.7172 | PR-AUC=0.7624 | Active Spearman=0.6075 | Top100 NDCG=0.5679 | Selection=0.6755 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 16/500 | Train Loss=0.4321 (cls=0.3591, reg=0.0730) | Val Loss=0.9501 | Val F1=0.6631 | Val PR-AUC=0.7048 | Val MAE=0.2835 | Active MAE=1.3135 | Active R2=-0.0320
+Epoch 16/200 | Train Loss=0.5588 (cls=0.3735, reg=0.1034, rank=0.5457) | Val Loss=0.6313 | F1=0.7131 | PR-AUC=0.7701 | Active Spearman=0.5982 | Top100 NDCG=0.5665 | Selection=0.6756 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 17/500 | Train Loss=0.4166 (cls=0.3425, reg=0.0742) | Val Loss=0.6575 | Val F1=0.7025 | Val PR-AUC=0.7572 | Val MAE=0.3144 | Active MAE=1.2695 | Active R2=0.0656
+Epoch 17/200 | Train Loss=0.5494 (cls=0.3654, reg=0.1028, rank=0.5410) | Val Loss=0.6086 | F1=0.7226 | PR-AUC=0.7576 | Active Spearman=0.6138 | Top100 NDCG=0.5555 | Selection=0.6689 | LR=1.00e-04
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 18/500 | Train Loss=0.4131 (cls=0.3414, reg=0.0718) | Val Loss=0.7102 | Val F1=0.7044 | Val PR-AUC=0.7417 | Val MAE=0.2827 | Active MAE=1.2312 | Active R2=0.0703
+Epoch 18/200 | Train Loss=0.5413 (cls=0.3624, reg=0.0983, rank=0.5379) | Val Loss=0.6266 | F1=0.6871 | PR-AUC=0.7784 | Active Spearman=0.6029 | Top100 NDCG=0.5902 | Selection=0.6900 | LR=1.00e-04
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 19/500 | Train Loss=0.3983 (cls=0.3263, reg=0.0720) | Val Loss=0.8208 | Val F1=0.6492 | Val PR-AUC=0.6696 | Val MAE=0.3057 | Active MAE=1.2585 | Active R2=0.0612
+Epoch 19/200 | Train Loss=0.5436 (cls=0.3610, reg=0.1011, rank=0.5434) | Val Loss=0.6135 | F1=0.7094 | PR-AUC=0.7791 | Active Spearman=0.6119 | Top100 NDCG=0.5668 | Selection=0.6797 | LR=1.00e-04
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 20/500 | Train Loss=0.3925 (cls=0.3239, reg=0.0686) | Val Loss=0.8157 | Val F1=0.6414 | Val PR-AUC=0.6599 | Val MAE=0.2963 | Active MAE=1.1929 | Active R2=0.1192
+Epoch 20/200 | Train Loss=0.5285 (cls=0.3477, reg=0.1003, rank=0.5371) | Val Loss=0.6413 | F1=0.6925 | PR-AUC=0.7703 | Active Spearman=0.5921 | Top100 NDCG=0.5801 | Selection=0.6817 | LR=5.00e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 21/500 | Train Loss=0.3805 (cls=0.3158, reg=0.0646) | Val Loss=1.0998 | Val F1=0.5852 | Val PR-AUC=0.6233 | Val MAE=0.2919 | Active MAE=1.2535 | Active R2=0.0335
+Epoch 21/200 | Train Loss=0.5129 (cls=0.3409, reg=0.0919, rank=0.5344) | Val Loss=0.6631 | F1=0.6802 | PR-AUC=0.7724 | Active Spearman=0.5907 | Top100 NDCG=0.5630 | Selection=0.6734 | LR=5.00e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 22/500 | Train Loss=0.3727 (cls=0.3092, reg=0.0635) | Val Loss=0.8598 | Val F1=0.6733 | Val PR-AUC=0.6940 | Val MAE=0.2920 | Active MAE=1.2325 | Active R2=0.0380
+Epoch 22/200 | Train Loss=0.5069 (cls=0.3346, reg=0.0924, rank=0.5318) | Val Loss=0.6550 | F1=0.6936 | PR-AUC=0.7777 | Active Spearman=0.5922 | Top100 NDCG=0.5809 | Selection=0.6839 | LR=5.00e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 23/500 | Train Loss=0.3431 (cls=0.2803, reg=0.0628) | Val Loss=0.7727 | Val F1=0.6827 | Val PR-AUC=0.7211 | Val MAE=0.2811 | Active MAE=1.1996 | Active R2=0.0923
+Epoch 23/200 | Train Loss=0.5093 (cls=0.3395, reg=0.0898, rank=0.5329) | Val Loss=0.6225 | F1=0.7256 | PR-AUC=0.7793 | Active Spearman=0.6126 | Top100 NDCG=0.5918 | Selection=0.6923 | LR=5.00e-05
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 24/500 | Train Loss=0.3341 (cls=0.2746, reg=0.0596) | Val Loss=0.9619 | Val F1=0.6660 | Val PR-AUC=0.6866 | Val MAE=0.2800 | Active MAE=1.2438 | Active R2=0.0242
+Epoch 24/200 | Train Loss=0.5030 (cls=0.3326, reg=0.0909, rank=0.5301) | Val Loss=0.6325 | F1=0.7053 | PR-AUC=0.7738 | Active Spearman=0.6006 | Top100 NDCG=0.5766 | Selection=0.6818 | LR=5.00e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 25/500 | Train Loss=0.3293 (cls=0.2700, reg=0.0593) | Val Loss=0.8519 | Val F1=0.6588 | Val PR-AUC=0.6705 | Val MAE=0.2821 | Active MAE=1.2104 | Active R2=0.0351
+Epoch 25/200 | Train Loss=0.4957 (cls=0.3246, reg=0.0917, rank=0.5295) | Val Loss=0.6567 | F1=0.6914 | PR-AUC=0.7775 | Active Spearman=0.5823 | Top100 NDCG=0.5599 | Selection=0.6721 | LR=5.00e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 26/500 | Train Loss=0.3189 (cls=0.2576, reg=0.0613) | Val Loss=0.9375 | Val F1=0.6776 | Val PR-AUC=0.6908 | Val MAE=0.2771 | Active MAE=1.2360 | Active R2=0.0041
+Epoch 26/200 | Train Loss=0.4982 (cls=0.3296, reg=0.0890, rank=0.5309) | Val Loss=0.6294 | F1=0.7087 | PR-AUC=0.7834 | Active Spearman=0.6044 | Top100 NDCG=0.5850 | Selection=0.6889 | LR=2.50e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 27/500 | Train Loss=0.3150 (cls=0.2548, reg=0.0602) | Val Loss=0.7818 | Val F1=0.6943 | Val PR-AUC=0.7111 | Val MAE=0.2787 | Active MAE=1.1946 | Active R2=0.0745
+Epoch 27/200 | Train Loss=0.4780 (cls=0.3154, reg=0.0838, rank=0.5248) | Val Loss=0.6204 | F1=0.7105 | PR-AUC=0.7834 | Active Spearman=0.6119 | Top100 NDCG=0.5856 | Selection=0.6901 | LR=2.50e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 28/500 | Train Loss=0.3065 (cls=0.2499, reg=0.0566) | Val Loss=0.8500 | Val F1=0.6837 | Val PR-AUC=0.6987 | Val MAE=0.2815 | Active MAE=1.2197 | Active R2=0.0484
+Epoch 28/200 | Train Loss=0.4842 (cls=0.3157, reg=0.0891, rank=0.5289) | Val Loss=0.6231 | F1=0.7157 | PR-AUC=0.7836 | Active Spearman=0.6063 | Top100 NDCG=0.5798 | Selection=0.6866 | LR=2.50e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 29/500 | Train Loss=0.3086 (cls=0.2503, reg=0.0584) | Val Loss=0.8762 | Val F1=0.6893 | Val PR-AUC=0.7274 | Val MAE=0.2747 | Active MAE=1.2224 | Active R2=0.0503
+Epoch 29/200 | Train Loss=0.4773 (cls=0.3123, reg=0.0860, rank=0.5266) | Val Loss=0.6304 | F1=0.7045 | PR-AUC=0.7825 | Active Spearman=0.6171 | Top100 NDCG=0.5900 | Selection=0.6928 | LR=2.50e-05
+保存当前最佳模型（综合 Top100 / 分类 / 回归验证指标）！
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 30/500 | Train Loss=0.3071 (cls=0.2484, reg=0.0587) | Val Loss=0.8067 | Val F1=0.7016 | Val PR-AUC=0.7199 | Val MAE=0.2779 | Active MAE=1.2223 | Active R2=0.0466
+Epoch 30/200 | Train Loss=0.4770 (cls=0.3108, reg=0.0871, rank=0.5274) | Val Loss=0.6422 | F1=0.7089 | PR-AUC=0.7767 | Active Spearman=0.5933 | Top100 NDCG=0.5681 | Selection=0.6774 | LR=2.50e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 31/500 | Train Loss=0.2896 (cls=0.2361, reg=0.0535) | Val Loss=0.8308 | Val F1=0.6754 | Val PR-AUC=0.7066 | Val MAE=0.2991 | Active MAE=1.2642 | Active R2=0.0780
+Epoch 31/200 | Train Loss=0.4741 (cls=0.3098, reg=0.0853, rank=0.5261) | Val Loss=0.6385 | F1=0.7112 | PR-AUC=0.7786 | Active Spearman=0.5929 | Top100 NDCG=0.5532 | Selection=0.6704 | LR=2.50e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 32/500 | Train Loss=0.2848 (cls=0.2281, reg=0.0567) | Val Loss=0.9313 | Val F1=0.6604 | Val PR-AUC=0.6821 | Val MAE=0.2819 | Active MAE=1.2366 | Active R2=0.0426
+Epoch 32/200 | Train Loss=0.4672 (cls=0.3042, reg=0.0845, rank=0.5234) | Val Loss=0.6395 | F1=0.6965 | PR-AUC=0.7778 | Active Spearman=0.5913 | Top100 NDCG=0.5593 | Selection=0.6730 | LR=1.25e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 33/500 | Train Loss=0.2780 (cls=0.2251, reg=0.0529) | Val Loss=0.9531 | Val F1=0.6746 | Val PR-AUC=0.6913 | Val MAE=0.2789 | Active MAE=1.2495 | Active R2=0.0218
+Epoch 33/200 | Train Loss=0.4694 (cls=0.3054, reg=0.0852, rank=0.5253) | Val Loss=0.6388 | F1=0.7049 | PR-AUC=0.7809 | Active Spearman=0.5973 | Top100 NDCG=0.5715 | Selection=0.6807 | LR=1.25e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 34/500 | Train Loss=0.2692 (cls=0.2193, reg=0.0500) | Val Loss=0.8871 | Val F1=0.6821 | Val PR-AUC=0.6966 | Val MAE=0.2834 | Active MAE=1.2263 | Active R2=0.0553
+Epoch 34/200 | Train Loss=0.4685 (cls=0.3066, reg=0.0829, rank=0.5268) | Val Loss=0.6381 | F1=0.7107 | PR-AUC=0.7817 | Active Spearman=0.6035 | Top100 NDCG=0.5924 | Selection=0.6921 | LR=1.25e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 35/500 | Train Loss=0.2677 (cls=0.2155, reg=0.0522) | Val Loss=0.9406 | Val F1=0.6744 | Val PR-AUC=0.6900 | Val MAE=0.2804 | Active MAE=1.2288 | Active R2=0.0452
+Epoch 35/200 | Train Loss=0.4669 (cls=0.3043, reg=0.0836, rank=0.5267) | Val Loss=0.6406 | F1=0.7097 | PR-AUC=0.7800 | Active Spearman=0.5982 | Top100 NDCG=0.5844 | Selection=0.6870 | LR=1.25e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 36/500 | Train Loss=0.2706 (cls=0.2167, reg=0.0540) | Val Loss=0.9016 | Val F1=0.6908 | Val PR-AUC=0.7117 | Val MAE=0.2755 | Active MAE=1.2306 | Active R2=0.0243
+Epoch 36/200 | Train Loss=0.4671 (cls=0.3024, reg=0.0858, rank=0.5258) | Val Loss=0.6408 | F1=0.7110 | PR-AUC=0.7821 | Active Spearman=0.5999 | Top100 NDCG=0.5744 | Selection=0.6827 | LR=1.25e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 37/500 | Train Loss=0.2581 (cls=0.2074, reg=0.0507) | Val Loss=0.8924 | Val F1=0.7018 | Val PR-AUC=0.7079 | Val MAE=0.2757 | Active MAE=1.2149 | Active R2=0.0587
+Epoch 37/200 | Train Loss=0.4641 (cls=0.3035, reg=0.0823, rank=0.5219) | Val Loss=0.6395 | F1=0.7059 | PR-AUC=0.7802 | Active Spearman=0.5983 | Top100 NDCG=0.5724 | Selection=0.6811 | LR=1.25e-05
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 38/500 | Train Loss=0.2670 (cls=0.2144, reg=0.0526) | Val Loss=0.8890 | Val F1=0.6833 | Val PR-AUC=0.7025 | Val MAE=0.2788 | Active MAE=1.2151 | Active R2=0.0600
+Epoch 38/200 | Train Loss=0.4671 (cls=0.3032, reg=0.0849, rank=0.5263) | Val Loss=0.6442 | F1=0.7121 | PR-AUC=0.7805 | Active Spearman=0.5923 | Top100 NDCG=0.5616 | Selection=0.6750 | LR=6.25e-06
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 39/500 | Train Loss=0.2648 (cls=0.2102, reg=0.0546) | Val Loss=0.9356 | Val F1=0.6817 | Val PR-AUC=0.6848 | Val MAE=0.2819 | Active MAE=1.2279 | Active R2=0.0505
+Epoch 39/200 | Train Loss=0.4635 (cls=0.2988, reg=0.0858, rank=0.5261) | Val Loss=0.6470 | F1=0.7110 | PR-AUC=0.7811 | Active Spearman=0.5898 | Top100 NDCG=0.5622 | Selection=0.6751 | LR=6.25e-06
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 40/500 | Train Loss=0.2588 (cls=0.2058, reg=0.0530) | Val Loss=0.9161 | Val F1=0.6716 | Val PR-AUC=0.6946 | Val MAE=0.2770 | Active MAE=1.2188 | Active R2=0.0496
+Epoch 40/200 | Train Loss=0.4620 (cls=0.2981, reg=0.0850, rank=0.5256) | Val Loss=0.6461 | F1=0.7090 | PR-AUC=0.7809 | Active Spearman=0.5910 | Top100 NDCG=0.5557 | Selection=0.6719 | LR=6.25e-06
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 41/500 | Train Loss=0.2449 (cls=0.1929, reg=0.0520) | Val Loss=0.9358 | Val F1=0.6826 | Val PR-AUC=0.6922 | Val MAE=0.2797 | Active MAE=1.2164 | Active R2=0.0593
+Epoch 41/200 | Train Loss=0.4587 (cls=0.2953, reg=0.0848, rank=0.5243) | Val Loss=0.6407 | F1=0.7111 | PR-AUC=0.7821 | Active Spearman=0.5955 | Top100 NDCG=0.5647 | Selection=0.6773 | LR=6.25e-06
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 42/500 | Train Loss=0.2512 (cls=0.2021, reg=0.0491) | Val Loss=0.9249 | Val F1=0.6831 | Val PR-AUC=0.6969 | Val MAE=0.2791 | Active MAE=1.2254 | Active R2=0.0484
+Epoch 42/200 | Train Loss=0.4517 (cls=0.2916, reg=0.0818, rank=0.5222) | Val Loss=0.6444 | F1=0.7111 | PR-AUC=0.7820 | Active Spearman=0.5964 | Top100 NDCG=0.5636 | Selection=0.6768 | LR=6.25e-06
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 43/500 | Train Loss=0.2472 (cls=0.1953, reg=0.0519) | Val Loss=0.9427 | Val F1=0.6824 | Val PR-AUC=0.6922 | Val MAE=0.2801 | Active MAE=1.2219 | Active R2=0.0501
+Epoch 43/200 | Train Loss=0.4503 (cls=0.2911, reg=0.0808, rank=0.5225) | Val Loss=0.6466 | F1=0.7111 | PR-AUC=0.7847 | Active Spearman=0.5986 | Top100 NDCG=0.5797 | Selection=0.6859 | LR=6.25e-06
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 44/500 | Train Loss=0.2415 (cls=0.1919, reg=0.0496) | Val Loss=0.9335 | Val F1=0.6774 | Val PR-AUC=0.6910 | Val MAE=0.2809 | Active MAE=1.2202 | Active R2=0.0550
+Epoch 44/200 | Train Loss=0.4573 (cls=0.2957, reg=0.0831, rank=0.5236) | Val Loss=0.6428 | F1=0.7124 | PR-AUC=0.7834 | Active Spearman=0.5962 | Top100 NDCG=0.5665 | Selection=0.6786 | LR=3.13e-06
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 45/500 | Train Loss=0.2428 (cls=0.1942, reg=0.0486) | Val Loss=0.9546 | Val F1=0.6845 | Val PR-AUC=0.6978 | Val MAE=0.2817 | Active MAE=1.2312 | Active R2=0.0584
+Epoch 45/200 | Train Loss=0.4506 (cls=0.2913, reg=0.0809, rank=0.5223) | Val Loss=0.6446 | F1=0.7112 | PR-AUC=0.7830 | Active Spearman=0.5956 | Top100 NDCG=0.5667 | Selection=0.6785 | LR=3.13e-06
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 46/500 | Train Loss=0.2463 (cls=0.1933, reg=0.0530) | Val Loss=0.9575 | Val F1=0.6873 | Val PR-AUC=0.6910 | Val MAE=0.2784 | Active MAE=1.2256 | Active R2=0.0427
+Epoch 46/200 | Train Loss=0.4537 (cls=0.2953, reg=0.0806, rank=0.5190) | Val Loss=0.6459 | F1=0.7089 | PR-AUC=0.7836 | Active Spearman=0.5951 | Top100 NDCG=0.5669 | Selection=0.6787 | LR=3.13e-06
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
-Epoch 47/500 | Train Loss=0.2461 (cls=0.1937, reg=0.0524) | Val Loss=0.9780 | Val F1=0.6815 | Val PR-AUC=0.6861 | Val MAE=0.2782 | Active MAE=1.2262 | Active R2=0.0403
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 48/500 | Train Loss=0.2362 (cls=0.1871, reg=0.0491) | Val Loss=0.9656 | Val F1=0.6846 | Val PR-AUC=0.6938 | Val MAE=0.2786 | Active MAE=1.2273 | Active R2=0.0477
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 49/500 | Train Loss=0.2362 (cls=0.1868, reg=0.0493) | Val Loss=0.9712 | Val F1=0.6865 | Val PR-AUC=0.6884 | Val MAE=0.2814 | Active MAE=1.2254 | Active R2=0.0582
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 50/500 | Train Loss=0.2303 (cls=0.1816, reg=0.0486) | Val Loss=0.9622 | Val F1=0.6845 | Val PR-AUC=0.6903 | Val MAE=0.2786 | Active MAE=1.2234 | Active R2=0.0536
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 51/500 | Train Loss=0.2269 (cls=0.1784, reg=0.0485) | Val Loss=0.9663 | Val F1=0.6915 | Val PR-AUC=0.6901 | Val MAE=0.2797 | Active MAE=1.2291 | Active R2=0.0488
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 52/500 | Train Loss=0.2284 (cls=0.1802, reg=0.0481) | Val Loss=0.9549 | Val F1=0.6893 | Val PR-AUC=0.6888 | Val MAE=0.2803 | Active MAE=1.2194 | Active R2=0.0636
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 53/500 | Train Loss=0.2278 (cls=0.1793, reg=0.0485) | Val Loss=0.9846 | Val F1=0.6925 | Val PR-AUC=0.6894 | Val MAE=0.2769 | Active MAE=1.2262 | Active R2=0.0447
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 54/500 | Train Loss=0.2282 (cls=0.1804, reg=0.0478) | Val Loss=0.9735 | Val F1=0.6885 | Val PR-AUC=0.6847 | Val MAE=0.2792 | Active MAE=1.2183 | Active R2=0.0600
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 55/500 | Train Loss=0.2245 (cls=0.1767, reg=0.0478) | Val Loss=0.9754 | Val F1=0.6908 | Val PR-AUC=0.6843 | Val MAE=0.2811 | Active MAE=1.2228 | Active R2=0.0566
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 56/500 | Train Loss=0.2268 (cls=0.1783, reg=0.0484) | Val Loss=0.9704 | Val F1=0.6890 | Val PR-AUC=0.6908 | Val MAE=0.2781 | Active MAE=1.2228 | Active R2=0.0504
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 57/500 | Train Loss=0.2294 (cls=0.1824, reg=0.0470) | Val Loss=0.9599 | Val F1=0.6909 | Val PR-AUC=0.6925 | Val MAE=0.2774 | Active MAE=1.2125 | Active R2=0.0635
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 58/500 | Train Loss=0.2281 (cls=0.1795, reg=0.0486) | Val Loss=0.9657 | Val F1=0.6877 | Val PR-AUC=0.6913 | Val MAE=0.2768 | Active MAE=1.2166 | Active R2=0.0568
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 59/500 | Train Loss=0.2211 (cls=0.1747, reg=0.0465) | Val Loss=0.9713 | Val F1=0.6979 | Val PR-AUC=0.6891 | Val MAE=0.2795 | Active MAE=1.2209 | Active R2=0.0587
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 60/500 | Train Loss=0.2255 (cls=0.1762, reg=0.0493) | Val Loss=0.9782 | Val F1=0.6929 | Val PR-AUC=0.6900 | Val MAE=0.2785 | Active MAE=1.2248 | Active R2=0.0509
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 61/500 | Train Loss=0.2273 (cls=0.1798, reg=0.0474) | Val Loss=0.9962 | Val F1=0.6900 | Val PR-AUC=0.6857 | Val MAE=0.2785 | Active MAE=1.2220 | Active R2=0.0514
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 62/500 | Train Loss=0.2234 (cls=0.1764, reg=0.0470) | Val Loss=0.9926 | Val F1=0.6899 | Val PR-AUC=0.6847 | Val MAE=0.2786 | Active MAE=1.2220 | Active R2=0.0522
-/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
-  return torch._transformer_encoder_layer_fwd(
-Epoch 63/500 | Train Loss=0.2230 (cls=0.1733, reg=0.0497) | Val Loss=0.9849 | Val F1=0.6878 | Val PR-AUC=0.6833 | Val MAE=0.2794 | Active MAE=1.2227 | Active R2=0.0533
-Early Stopping at Epoch 63
+Epoch 47/200 | Train Loss=0.4528 (cls=0.2935, reg=0.0809, rank=0.5228) | Val Loss=0.6459 | F1=0.7105 | PR-AUC=0.7839 | Active Spearman=0.5946 | Top100 NDCG=0.5674 | Selection=0.6790 | LR=3.13e-06
+Early Stopping at Epoch 47
 
-训练结束，最佳验证损失：0.639281
+训练结束，最佳验证综合分数：0.692778
+训练期间最低验证损失：0.608140
 /data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
   return torch._transformer_encoder_layer_fwd(
 
 ========== TEST RESULTS ==========
-Loss: 0.7070213120542778
-Accuracy: 0.8506705328017398
-Precision: 0.5812807881773399
-Recall: 0.8676470588235294
-F1: 0.696165191740413
-ROC_AUC: 0.931982804408445
-PR_AUC: 0.7586875332585322
-MAE: 0.3224537968635559
-RMSE: 1.0435551627127873
-R2: 0.28946447372436523
-Active_MAE: 1.1908445358276367
-Active_RMSE: 2.183055395048216
-Active_R2: 0.2016991376876831
-Active_Spearman: 0.5323239037929873
-测试集预测结果已保存！
+Accuracy: 0.861857252494244
+Precision: 0.6385350318471338
+Recall: 0.7509363295880149
+F1: 0.6901893287435457
+ROC_AUC: 0.9132738275996704
+PR_AUC: 0.7263355203515963
+MAE: 0.3066825594800218
+RMSE: 1.10171138667259
+R2: 0.2220783302247754
+Active_MAE: 1.1259860687693826
+Active_RMSE: 2.2898076008588757
+Active_R2: 0.15609914476876363
+Active_Spearman: 0.612239829945451
+TopK: 100
+TopK_Precision: 0.43
+TopK_Recall: 0.43
+TopK_NDCG: 0.5864920258173266
+TopK_Mean_True_Activity: 3.0341940228641033
+TopK_Mean_Predicted_Score: 4.684318107904612
+TopK_Active_Ratio: 0.8
+TopK_True_Active_Count: 534
+Loss: 0.6893604803426111
+测试集预测结果已保存：/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/model_activity_Activity_top/test_predictions.csv
+测试集预测 Top100 已保存：/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/model_activity_Activity_top/test_top100_predictions.csv
