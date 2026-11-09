@@ -1,559 +1,222 @@
-# -*- coding: utf-8 -*-
-#np.set_printoptions(threshold=np.inf)
-#!/usr/bin/env python3
-# coding: utf-8
-
-import os
-import random
-import numpy as np
-import pandas as pd
-import pickle
-from tqdm import tqdm
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from scipy.stats import pearsonr
-import heapq
-import torch
-import torch.nn.functional as F
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import (
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score,
-    roc_auc_score,
-    average_precision_score,
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score
-)
-from scipy.stats import pearsonr, spearmanr
-# ========================
-# 1️⃣ 固定随机种子
-# ========================
-def set_seed(seed=123):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-
-# ========================
-# 2️⃣ Dataset 定义
-# ========================
-class EnzymeSubstrateDataset(Dataset):
-    def __init__(self, df, esm_embeds, mol_embeds1,mol_embeds2,threshold=0.03):
-        """
-        df: pandas.DataFrame, must include columns:
-            - name (key to esm_embeds)
-            - SMILES (key to mol_embeds)
-            - Conv (label)
-            - SM_norm (归一化后的底物浓度)
-            - Enz_norm (归一化后的酶浓度)
-        esm_embeds: dict[name] -> {"emb": tensor[L, d], "mask": tensor[L]}
-        mol_embeds: dict[smiles] -> vector (numpy/torch)
-        """
-        self.df = df.reset_index(drop=True)
-        self.idx = df["Name"].astype(str).tolist()
-        self.smiles1 = df["SM_胺"].tolist()
-        self.smiles2 = df["SM_酮"].tolist()
-        # self.labels = df["Activity"].astype(float).tolist()
-        self.labels = pd.to_numeric(self.df['Activity'],errors="coerce").fillna(0).astype(float).to_numpy()
-        n_neg_label = int((self.labels < 0).sum())
-        if n_neg_label:
-            print(f"⚠️ 标签中有 {n_neg_label} 条负值 Activity，已截断为 0（按无活性处理）")
-        self.labels =np.clip(self.labels,0.0,None)
-        self.esm_embeds = esm_embeds
-        self.mol_embeds1 = mol_embeds1
-        self.mol_embeds2 = mol_embeds2
-        self.threshold = threshold
-
-        # # 归一化后浓度列（log+zscore，在 main() 中计算）
-        # if "SM_norm" not in df.columns or "Enz_norm" not in df.columns:
-        #     raise ValueError("DataFrame must contain 'SM_norm' and 'Enz_norm' columns.")
-        # self.sm_norm = df["SM_norm"].astype(float).tolist()
-        # self.enzyme_norm = df["Enz_norm"].astype(float).tolist()
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, i):
-        idx = self.idx[i]
-        esm_data = self.esm_embeds[idx]  # {"emb": tensor, "mask": tensor}
-        esm_emb = esm_data["emb"].float()    # e.g. [L, d]
-        esm_mask = esm_data["mask"].long()   # e.g. [L]
-        mol_feat1 = torch.tensor(self.mol_embeds1[self.smiles1[i]], dtype=torch.float32)
-        mol_feat2 = torch.tensor(self.mol_embeds2[self.smiles2[i]], dtype=torch.float32)
-
-        activity = float(self.labels[i])
-        #分类标签
-        cls_label = float(activity >= self.threshold)
-        #回归标签
-        reg_label = float(np.log1p(activity))  # 浓度：归一化后的标量，保持 shape [1]
-        #仅有效活性样本参与回归
-        reg_mask =float(activity >= self.threshold)  
-        
-        # sm_load = torch.tensor([self.sm_norm[i]], dtype=torch.float32)
-        # enz_load = torch.tensor([self.enzyme_norm[i]], dtype=torch.float32)
-
-        # label = torch.tensor(self.labels[i], dtype=torch.float32)
-        return esm_emb, esm_mask, mol_feat1, mol_feat2, torch.tensor(cls_label,dtype=torch.float32), torch.tensor(reg_label,dtype=torch.float32), torch.tensor(reg_mask),torch.tensor(activity,dtype=torch.float32)
-
-# ========================
-# 3️⃣ 模型定义（包含两个浓度的 1->128 映射）
-# ========================
-class EnzymeSubstrateRegressor(nn.Module):
-    def __init__(self, esm_dim=1280, mol_dim=768, dropout=0.1, hidden_dim=256):
-        super().__init__()
-        # ESM projection: esm_dim -> 256 (via 512 -> 256)
-        self.esm_proj = nn.Sequential(
-            nn.Linear(esm_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
-        )
-        # Mol projection: mol_dim -> 256
-        self.mol_proj1 = nn.Sequential(
-            nn.Linear(mol_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
-        )
-
-        self.mol_proj2 = nn.Sequential(
-            nn.Linear(mol_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
-        )
-
-        # Transformer encoder for esm sequence tokens (keeps d_model=256)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=256, nhead=8, dim_feedforward=512, dropout=dropout, batch_first=True
-        )
-        # enable_nested_tensor=False：关闭嵌套张量快路径，
-        # 否则带 padding mask 时输出长度会被截到"本 batch 最长有效序列"（如 325），
-        # 与固定长度 400 的 mask 对不上，masked-mean-pooling 会报尺寸不匹配
-        self.esm_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=2, enable_nested_tensor=False
-        )
-
-        # # 浓度投影：1 -> 64 -> 128（分别为 SM 和 Enzyme）
-        # self.sm_proj = nn.Sequential(
-        #     nn.Linear(1, 64),
-        #     nn.ReLU(),
-        #     nn.Linear(64, 128),
-        #     nn.LayerNorm(128)
-        # )
-        # self.enz_proj = nn.Sequential(
-        #     nn.Linear(1, 64),
-        #     nn.ReLU(),
-        #     nn.Linear(64, 128),
-        #     nn.LayerNorm(128)
-        # )
-
-        # 全连接层：输入维度 256 + 256 + 128 + 128 = 768
-        # input_dim = 256 + 256 + 128 + 128
-        input_dim = 256 + 256 + 256
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.bn3 = nn.BatchNorm1d(hidden_dim // 2)
-        self.dropout = nn.Dropout(dropout)
-        #分类头
-        self.cls_head = nn.Linear(hidden_dim // 2, 1)
-        #回归头
-        self.reg_head = nn.Linear(hidden_dim // 2, 1)
-        # self.fc4 = nn.Linear(hidden_dim // 2, 1)
-        # self.dropout = nn.Dropout(0.2)
-
-    def forward(self, esm_feat, esm_mask, mol_feat1, mol_feat2):
-        # esm_feat: [B, L, esm_dim]  (if loaded as [L, d] per sample, DataLoader must batch consistently)
-        # esm_mask: [B, L]
-        # mol_feat: [B, mol_dim]
-        # sm_load, enz_load: [B, 1]
-
-        # Project token features
-        esm_feat = self.esm_proj(esm_feat)  # [B, L, 256]
-
-        # Build src_key_padding_mask for Transformer: True where padding (mask==0)
-        src_mask = esm_mask == 0  # [B, L] bool
-
-        # Transformer Encoder
-        esm_feat = self.esm_encoder(esm_feat, src_key_padding_mask=src_mask)  # [B, L, 256]
-
-        # Masked mean pooling over sequence length
-        mask_expanded = esm_mask.unsqueeze(-1).float()  # [B, L, 1]
-        denom = mask_expanded.sum(dim=1) + 1e-8  # [B, 1]
-        esm_pooled = (esm_feat * mask_expanded).sum(dim=1) / denom  # [B, 256]
-
-        # Mol projection
-        mol_proj1 = self.mol_proj1(mol_feat1)  # [B, 256]
-        mol_proj2 = self.mol_proj2(mol_feat2)  # [B, 256]
-
-        # # Concentration projections
-        # sm_proj = self.sm_proj(sm_load)   # [B, 128]
-        # enz_proj = self.enz_proj(enz_load)  # [B, 128]
-
-        # Concat all
-        # x = torch.cat([esm_pooled, enz_proj, mol_proj, sm_proj], dim=-1)  # [B, 768]
-
-        x = torch.cat([esm_pooled, mol_proj1, mol_proj2], dim=-1)  # [B, 768 + 256 + 256]
-
-        # FC blocks with residual
-        x = F.relu(self.bn1(self.fc1(x)))
-        residual = x
-        x = F.relu(self.bn2(self.fc2(x)))
-        x = self.dropout(x)
-        x = x + residual
-        x = F.relu(self.bn3(self.fc3(x)))
-
-        x=self.dropout(x)
-        cls_pred = self.cls_head(x).squeeze(-1)  # [B, 1]
-        reg_pred = self.reg_head(x).squeeze(-1)  # [B, 1]
-        # x = self.fc4(x)  # [B, 1]
-        # return x.squeeze(-1)  # [B]
-        return cls_pred, reg_pred
-
-# 多任务损失函数
-class MultiTaskLoss(nn.Module):
-    def __init__(self, pos_weight=4.0,lambda_cls=1.0,lambda_reg=1.0):
-
-        super().__init__()
-
-        self.register_buffer("pos_weight",torch.tensor(float(pos_weight)))
-        self.lambda_cls = lambda_cls
-        self.lambda_reg = lambda_reg
-        self.cls_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
-
-        self.reg_loss = nn.SmoothL1Loss(reduction="none")
-
-    def forward(self, cls_logits, reg_output,
-                cls_target, reg_target, reg_mask):
-
-        # 分类损失：全部样本
-        loss_cls = self.cls_loss(cls_logits, cls_target)
-        # 回归损失：仅有效活性样本
-        loss_reg_each = self.reg_loss(reg_output, reg_target)
-        loss_reg = (loss_reg_each * reg_mask).sum() / reg_mask.sum().clamp_min(1.0)
-
-        loss = (self.lambda_cls * loss_cls+ self.lambda_reg * loss_reg)
-
-        return loss, loss_cls, loss_reg
-
-
-# ========================
-# 4️⃣ 评估函数（与原脚本保持一致）
-# ========================
-def evaluate(model, loader, device, criterion=None,threshold=0.03):
-    model.eval()
-    all_cls, all_reg = [], []
-    all_cls_y, all_reg_y = [], []
-    all_raw_y = []
-    total_loss = 0.0
-    total_samples = 0
-    with torch.no_grad():
-        for batch in loader:
-            (esm_feat, esm_mask, mol_feat1, mol_feat2,cls_y, reg_y, reg_mask, raw_y) = batch
-            esm_feat = esm_feat.to(device)
-            esm_mask = esm_mask.to(device)
-            mol_feat1 = mol_feat1.to(device)
-            mol_feat2 = mol_feat2.to(device)
-            cls_y = cls_y.to(device)
-            reg_y = reg_y.to(device)
-            reg_mask = reg_mask.to(device)
-
-            cls_logits, reg_output = model(esm_feat, esm_mask, mol_feat1, mol_feat2)
-            if criterion is not None:
-                loss, _, _ = criterion(cls_logits, reg_output,cls_y, reg_y, reg_mask)
-                total_loss += loss.item() * len(raw_y)
-                total_samples += len(raw_y)
-
-            cls_prob = torch.sigmoid(cls_logits)
-
-            # log1p(Activity) 转换回原始活性尺度
-            reg_pred = torch.expm1(reg_output.clamp(min=0, max=10))
-            # 期望活性估计
-            expected_activity = cls_prob * reg_pred
-
-            all_cls.extend(cls_prob.cpu().numpy())
-            all_reg.extend(reg_pred.cpu().numpy())
-            all_cls_y.extend(cls_y.cpu().numpy())
-            all_reg_y.extend(reg_y.cpu().numpy())
-            all_raw_y.extend(raw_y.cpu().numpy())
-
-    all_cls = np.array(all_cls)
-    all_reg = np.array(all_reg)
-    all_raw_y = np.array(all_raw_y)
-
-    all_cls_y = np.array(all_cls_y).astype(int)
-
-    expected_activity = all_cls * all_reg
-
-    # 分类指标
-    pred_class = (all_cls >= 0.5).astype(int)
-
-    acc = accuracy_score(all_cls_y, pred_class)
-    precision = precision_score(all_cls_y, pred_class, zero_division=0)
-    recall = recall_score(all_cls_y, pred_class, zero_division=0)
-    f1 = f1_score(all_cls_y, pred_class, zero_division=0)
-
-    if len(np.unique(all_cls_y)) == 2:
-        auc = roc_auc_score(all_cls_y, all_cls)
-        pr_auc = average_precision_score(all_cls_y, all_cls)
-    else:
-        auc, pr_auc = np.nan, np.nan
-
-    # 原始活性尺度下的整体预测
-    mse = mean_squared_error(all_raw_y, expected_activity)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(all_raw_y, expected_activity)
-    r2 = r2_score(all_raw_y, expected_activity)
-
-    # 只评价真实有效活性样本的条件回归能力
-    active_mask = all_raw_y >= threshold
-
-    if active_mask.sum() > 1:
-        active_mae = mean_absolute_error(all_raw_y[active_mask],all_reg[active_mask])
-        active_rmse = np.sqrt(mean_squared_error(all_raw_y[active_mask],all_reg[active_mask]))
-        active_r2 = r2_score(all_raw_y[active_mask],all_reg[active_mask])
-        active_spearman = spearmanr(all_raw_y[active_mask],all_reg[active_mask]).statistic
-    else:
-        active_mae = np.nan
-        active_rmse = np.nan
-        active_r2 = np.nan
-        active_spearman = np.nan
-    avg_loss = (total_loss / total_samples if criterion is not None else None)
-
-    metrics = {
-        "Loss": avg_loss,
-        "Accuracy": acc,
-        "Precision": precision,
-        "Recall": recall,
-        "F1": f1,
-        "ROC_AUC": auc,
-        "PR_AUC": pr_auc,
-        "MAE": mae,
-        "RMSE": rmse,
-        "R2": r2,
-        "Active_MAE": active_mae,
-        "Active_RMSE": active_rmse,
-        "Active_R2": active_r2,
-        "Active_Spearman": active_spearman
-    }
-
-    predictions = {
-        "true": all_raw_y,
-        "prob": all_cls,
-        "conditional_activity": all_reg,
-        "expected_activity": expected_activity
-    }
-
-    return metrics, predictions
-
-
-# ========================
-# 5️⃣ 训练函数（保存 top-5 + best）
-# ========================
-def train_model(train_loader,val_loader,model,optimizer,criterion,device,epochs=300,patience=30):
-
-    model_dir = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/model_activity_Activity"
-    os.makedirs(model_dir, exist_ok=True)
-    best_val_loss = float("inf")
-    patience_counter = 0
-
-    history = []
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=8,
-        min_lr=1e-6)
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0.0
-        total_cls = 0.0
-        total_reg = 0.0
-
-        for batch in train_loader:
-            (esm_feat, esm_mask, mol_feat1, mol_feat2,cls_y, reg_y, reg_mask, raw_y) = batch
-            esm_feat = esm_feat.to(device)
-            esm_mask = esm_mask.to(device)
-            mol_feat1 = mol_feat1.to(device)
-            mol_feat2 = mol_feat2.to(device)
-
-            cls_y = cls_y.to(device)
-            reg_y = reg_y.to(device)
-            reg_mask = reg_mask.to(device)
-
-            cls_logits, reg_output = model(esm_feat, esm_mask, mol_feat1, mol_feat2)
-
-            loss, loss_cls, loss_reg = criterion(cls_logits,reg_output,cls_y,reg_y,reg_mask)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            total_loss += loss.item()
-            total_cls += loss_cls.item()
-            total_reg += loss_reg.item()
-
-        n_batch = len(train_loader)
-        train_loss = total_loss / n_batch
-        train_cls = total_cls / n_batch
-        train_reg = total_reg / n_batch
-
-        # 验证
-        val_metrics, val_pred = evaluate(model, val_loader, device, criterion)
-        val_loss = val_metrics["Loss"]
-        scheduler.step(val_loss)
-
-        print(
-            f"Epoch {epoch+1}/{epochs} | "
-            f"Train Loss={train_loss:.4f} (cls={train_cls:.4f}, reg={train_reg:.4f}) | "
-            f"Val Loss={val_loss:.4f} | "
-            f"Val F1={val_metrics['F1']:.4f} | "
-            f"Val PR-AUC={val_metrics['PR_AUC']:.4f} | "
-            f"Val MAE={val_metrics['MAE']:.4f} | "
-            f"Active MAE={val_metrics['Active_MAE']:.4f} | "
-            f"Active R2={val_metrics['Active_R2']:.4f}"
-        )
-
-        history.append({
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            **{
-                "val_" + k: v
-                for k, v in val_metrics.items()
-            }
-        })
-
-        # 保存最佳模型
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(),os.path.join(model_dir, "best_model.pth"))
-            print("保存最佳模型！")
-        else:
-            patience_counter += 1
-        if patience_counter >= patience:
-            print(f"Early Stopping at Epoch {epoch+1}")
-            break
-
-    pd.DataFrame(history).to_csv(os.path.join(model_dir, "training_history.csv"),index=False)
-
-    print(f"\n训练结束，最佳验证损失：{best_val_loss:.6f}")
-
-# ========================
-# 6️⃣ 主程序
-# ========================
-def main():
-    set_seed(123)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Using device:", device)
-
-    # ---------- 加载特征（ESM & Mol） ----------
-    esm_pkl = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/Feature/esm_feats_emb_mask.pkl"
-    mol_pkl1 = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/Feature/SM_胺.pkl"
-    mol_pkl2 = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/Feature/SM_酮.pkl"
-    with open(esm_pkl, "rb") as f:
-        esm_dict = pickle.load(f)
-    with open(mol_pkl1, "rb") as f:
-        mol_dict1 = pickle.load(f)
-    with open(mol_pkl2, "rb") as f:
-        mol_dict2 = pickle.load(f)
-        
-    print(f"✅ 已加载 ESM 特征: {len(esm_dict)} 条 | MolFormer 特征: {len(mol_dict1)} 条 | MolFormer 特征: {len(mol_dict2)} 条")
-
-    # ---------- 数据划分（使用你已有的 split txt） ----------
-    split_dir = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/split_data_Activaty"
-    with open(os.path.join(split_dir, "train.txt")) as f:
-        train_idx = [line.strip() for line in f if line.strip()]
-    with open(os.path.join(split_dir, "val.txt")) as f:
-        val_idx = [line.strip() for line in f if line.strip()]
-    with open(os.path.join(split_dir, "test.txt")) as f:
-        test_idx = [line.strip() for line in f if line.strip()]
-    # ---------- 数据读取 ----------
-    csv_path = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/train_Activity_std2.csv"
-    df = pd.read_csv(csv_path)
-    print("Loaded df:", df.shape)
-    df["idx"] = df["idx"].astype(str)
-    df_train = df[df["idx"].isin(train_idx)].reset_index(drop=True)
-    df_val = df[df["idx"].isin(val_idx)].reset_index(drop=True)
-    df_test = df[df["idx"].isin(test_idx)].reset_index(drop=True)
-    print(f"📂 数据集大小: train={len(df_train)}, val={len(df_val)}, test={len(df_test)}")
-
-    # SM_COL = "SM loading (g/L)"
-    # ENZ_COL = "Enzyme loading (g/L)"
-
-    # for d in [df_train, df_val, df_test]:
-    #     d[SM_COL] = pd.to_numeric(d[SM_COL], errors="coerce").fillna(0.0).clip(lower=0.0)
-    #     d[ENZ_COL] = pd.to_numeric(d[ENZ_COL], errors="coerce").fillna(0.0).clip(lower=0.0)
-        # d["SM_log"] = np.log1p(d[SM_COL].astype(float))
-        # d["Enz_log"] = np.log1p(d[ENZ_COL].astype(float))
-
-    # sm_mean = df_train["SM_log"].mean()
-    # sm_std = df_train["SM_log"].std() + 1e-12
-    # enz_mean = df_train["Enz_log"].mean()
-    # enz_std = df_train["Enz_log"].std() + 1e-12
-
-    # for d in [df_train, df_val, df_test]:
-    #     d["SM_norm"] = (d["SM_log"] - sm_mean) / sm_std
-    #     d["Enz_norm"] = (d["Enz_log"] - enz_mean) / enz_std
-
-    # print("SM_log mean/std (train):", sm_mean, sm_std)
-    # print("Enz_log mean/std (train):", enz_mean, enz_std)
-
-    # ---------- Dataset & DataLoader ----------
-    train_set = EnzymeSubstrateDataset(df_train, esm_dict, mol_dict1, mol_dict2, threshold=0.03)
-    val_set = EnzymeSubstrateDataset(df_val, esm_dict, mol_dict1, mol_dict2, threshold=0.03)
-    test_set = EnzymeSubstrateDataset(df_test, esm_dict, mol_dict1, mol_dict2, threshold=0.03)
-
-    train_loader = DataLoader(train_set, batch_size=256, shuffle=True, num_workers=4, pin_memory=True,drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=256, shuffle=True, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
-
-    # ---------- 模型、优化器、损失 ----------
-    model = EnzymeSubstrateRegressor(esm_dim=1280, mol_dim=768, dropout=0.25, hidden_dim=256).to(device)
-    # Loss
-    n_pos = (df_train["Activity"] >= 0.03).sum()
-    n_neg = len(df_train) - n_pos
-    pos_weight = n_neg / max(n_pos, 1)
-    criterion = MultiTaskLoss(pos_weight=pos_weight,lambda_cls=1.0,lambda_reg=1.0).to(device)
-    print("Positive weight:", pos_weight)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    # criterion = nn.MSELoss()
-
-    # ---------- 训练 ----------
-    train_model(train_loader, val_loader, model, optimizer, criterion, device, epochs=500,patience=50)
-
-    # ---------- 测试评估 ----------
-    best_model_path = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/model_activity_Activity/best_model.pth"
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
-    model.to(device)
-
-    test_metrics, test_predictions = evaluate(model,test_loader,device,criterion)
-    print("\n========== TEST RESULTS ==========")
-    for key, value in test_metrics.items():
-        print(f"{key}: {value}")
-
-    # Save predictions
-    result_df = df_test.reset_index(drop=True).copy()
-    result_df["True_Activity"] = test_predictions["true"]
-    result_df["Pred_Probability"] = test_predictions["prob"]
-    result_df["Pred_Conditional_Activity"] = (test_predictions["conditional_activity"])
-    result_df["Pred_Expected_Activity"] = (test_predictions["expected_activity"])
-
-    result_df.to_csv("/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/model_activity_Activity/test_predictions.csv",index=False)
-    print("测试集预测结果已保存！")
-
-    # test_loss, mse, rmse, mae, r2, pearson = evaluate(model, test_loader, device, criterion)
-    # print(f"\n🧪 Test | Loss={test_loss:.4f} | MSE={mse:.4f} | RMSE={rmse:.4f} | "
-    #       f"MAE={mae:.4f} | R2={r2:.4f} | Pearson={pearson:.4f}")
-
-if __name__ == "__main__":
-    main()
+nohup: ignoring input
+Using device: cuda
+✅ 已加载 ESM 特征: 165 条 | MolFormer 特征: 23 条 | MolFormer 特征: 12 条
+Loaded df: (17470, 8)
+📂 数据集大小: train=12092, val=2619, test=2759
+Positive weight: 3.9355102040816328
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 1/500 | Train Loss=1.0323 (cls=0.8237, reg=0.2087) | Val Loss=0.8447 | Val F1=0.6218 | Val PR-AUC=0.7214 | Val MAE=0.2976 | Active MAE=1.2225 | Active R2=-0.0085
+保存最佳模型！
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 2/500 | Train Loss=0.8087 (cls=0.6608, reg=0.1479) | Val Loss=0.7373 | Val F1=0.6270 | Val PR-AUC=0.7306 | Val MAE=0.3182 | Active MAE=1.1679 | Active R2=0.1530
+保存最佳模型！
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 3/500 | Train Loss=0.7440 (cls=0.6078, reg=0.1361) | Val Loss=0.7060 | Val F1=0.6599 | Val PR-AUC=0.7335 | Val MAE=0.3408 | Active MAE=1.2837 | Active R2=0.1393
+保存最佳模型！
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 4/500 | Train Loss=0.6964 (cls=0.5737, reg=0.1227) | Val Loss=0.6983 | Val F1=0.6682 | Val PR-AUC=0.7222 | Val MAE=0.2860 | Active MAE=1.1664 | Active R2=0.0675
+保存最佳模型！
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 5/500 | Train Loss=0.6435 (cls=0.5397, reg=0.1038) | Val Loss=0.7319 | Val F1=0.7008 | Val PR-AUC=0.7347 | Val MAE=0.3038 | Active MAE=1.2363 | Active R2=0.0858
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 6/500 | Train Loss=0.6117 (cls=0.5101, reg=0.1016) | Val Loss=0.9523 | Val F1=0.6340 | Val PR-AUC=0.6750 | Val MAE=0.2834 | Active MAE=1.3104 | Active R2=-0.0846
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 7/500 | Train Loss=0.5909 (cls=0.4921, reg=0.0988) | Val Loss=0.8248 | Val F1=0.6806 | Val PR-AUC=0.6917 | Val MAE=0.2845 | Active MAE=1.2671 | Active R2=-0.0284
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 8/500 | Train Loss=0.5630 (cls=0.4671, reg=0.0959) | Val Loss=0.8121 | Val F1=0.6437 | Val PR-AUC=0.6766 | Val MAE=0.2857 | Active MAE=1.2889 | Active R2=0.0491
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 9/500 | Train Loss=0.5444 (cls=0.4525, reg=0.0919) | Val Loss=1.0318 | Val F1=0.6038 | Val PR-AUC=0.6935 | Val MAE=0.2923 | Active MAE=1.3610 | Active R2=-0.1338
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 10/500 | Train Loss=0.5186 (cls=0.4305, reg=0.0881) | Val Loss=1.1072 | Val F1=0.5837 | Val PR-AUC=0.6222 | Val MAE=0.2789 | Active MAE=1.2497 | Active R2=0.0470
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 11/500 | Train Loss=0.5031 (cls=0.4176, reg=0.0855) | Val Loss=0.7003 | Val F1=0.6986 | Val PR-AUC=0.7348 | Val MAE=0.2686 | Active MAE=1.2154 | Active R2=0.0454
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 12/500 | Train Loss=0.4906 (cls=0.4076, reg=0.0830) | Val Loss=0.8871 | Val F1=0.6680 | Val PR-AUC=0.6704 | Val MAE=0.2778 | Active MAE=1.2908 | Active R2=-0.0292
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 13/500 | Train Loss=0.4720 (cls=0.3914, reg=0.0805) | Val Loss=0.6393 | Val F1=0.7078 | Val PR-AUC=0.7588 | Val MAE=0.2926 | Active MAE=1.2084 | Active R2=0.1246
+保存最佳模型！
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 14/500 | Train Loss=0.4530 (cls=0.3735, reg=0.0795) | Val Loss=0.7679 | Val F1=0.6471 | Val PR-AUC=0.7070 | Val MAE=0.3979 | Active MAE=1.5543 | Active R2=-0.0425
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 15/500 | Train Loss=0.4467 (cls=0.3739, reg=0.0728) | Val Loss=0.6975 | Val F1=0.6874 | Val PR-AUC=0.7119 | Val MAE=0.3002 | Active MAE=1.1965 | Active R2=0.0489
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 16/500 | Train Loss=0.4321 (cls=0.3591, reg=0.0730) | Val Loss=0.9501 | Val F1=0.6631 | Val PR-AUC=0.7048 | Val MAE=0.2835 | Active MAE=1.3135 | Active R2=-0.0320
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 17/500 | Train Loss=0.4166 (cls=0.3425, reg=0.0742) | Val Loss=0.6575 | Val F1=0.7025 | Val PR-AUC=0.7572 | Val MAE=0.3144 | Active MAE=1.2695 | Active R2=0.0656
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 18/500 | Train Loss=0.4131 (cls=0.3414, reg=0.0718) | Val Loss=0.7102 | Val F1=0.7044 | Val PR-AUC=0.7417 | Val MAE=0.2827 | Active MAE=1.2312 | Active R2=0.0703
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 19/500 | Train Loss=0.3983 (cls=0.3263, reg=0.0720) | Val Loss=0.8208 | Val F1=0.6492 | Val PR-AUC=0.6696 | Val MAE=0.3057 | Active MAE=1.2585 | Active R2=0.0612
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 20/500 | Train Loss=0.3925 (cls=0.3239, reg=0.0686) | Val Loss=0.8157 | Val F1=0.6414 | Val PR-AUC=0.6599 | Val MAE=0.2963 | Active MAE=1.1929 | Active R2=0.1192
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 21/500 | Train Loss=0.3805 (cls=0.3158, reg=0.0646) | Val Loss=1.0998 | Val F1=0.5852 | Val PR-AUC=0.6233 | Val MAE=0.2919 | Active MAE=1.2535 | Active R2=0.0335
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 22/500 | Train Loss=0.3727 (cls=0.3092, reg=0.0635) | Val Loss=0.8598 | Val F1=0.6733 | Val PR-AUC=0.6940 | Val MAE=0.2920 | Active MAE=1.2325 | Active R2=0.0380
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 23/500 | Train Loss=0.3431 (cls=0.2803, reg=0.0628) | Val Loss=0.7727 | Val F1=0.6827 | Val PR-AUC=0.7211 | Val MAE=0.2811 | Active MAE=1.1996 | Active R2=0.0923
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 24/500 | Train Loss=0.3341 (cls=0.2746, reg=0.0596) | Val Loss=0.9619 | Val F1=0.6660 | Val PR-AUC=0.6866 | Val MAE=0.2800 | Active MAE=1.2438 | Active R2=0.0242
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 25/500 | Train Loss=0.3293 (cls=0.2700, reg=0.0593) | Val Loss=0.8519 | Val F1=0.6588 | Val PR-AUC=0.6705 | Val MAE=0.2821 | Active MAE=1.2104 | Active R2=0.0351
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 26/500 | Train Loss=0.3189 (cls=0.2576, reg=0.0613) | Val Loss=0.9375 | Val F1=0.6776 | Val PR-AUC=0.6908 | Val MAE=0.2771 | Active MAE=1.2360 | Active R2=0.0041
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 27/500 | Train Loss=0.3150 (cls=0.2548, reg=0.0602) | Val Loss=0.7818 | Val F1=0.6943 | Val PR-AUC=0.7111 | Val MAE=0.2787 | Active MAE=1.1946 | Active R2=0.0745
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 28/500 | Train Loss=0.3065 (cls=0.2499, reg=0.0566) | Val Loss=0.8500 | Val F1=0.6837 | Val PR-AUC=0.6987 | Val MAE=0.2815 | Active MAE=1.2197 | Active R2=0.0484
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 29/500 | Train Loss=0.3086 (cls=0.2503, reg=0.0584) | Val Loss=0.8762 | Val F1=0.6893 | Val PR-AUC=0.7274 | Val MAE=0.2747 | Active MAE=1.2224 | Active R2=0.0503
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 30/500 | Train Loss=0.3071 (cls=0.2484, reg=0.0587) | Val Loss=0.8067 | Val F1=0.7016 | Val PR-AUC=0.7199 | Val MAE=0.2779 | Active MAE=1.2223 | Active R2=0.0466
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 31/500 | Train Loss=0.2896 (cls=0.2361, reg=0.0535) | Val Loss=0.8308 | Val F1=0.6754 | Val PR-AUC=0.7066 | Val MAE=0.2991 | Active MAE=1.2642 | Active R2=0.0780
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 32/500 | Train Loss=0.2848 (cls=0.2281, reg=0.0567) | Val Loss=0.9313 | Val F1=0.6604 | Val PR-AUC=0.6821 | Val MAE=0.2819 | Active MAE=1.2366 | Active R2=0.0426
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 33/500 | Train Loss=0.2780 (cls=0.2251, reg=0.0529) | Val Loss=0.9531 | Val F1=0.6746 | Val PR-AUC=0.6913 | Val MAE=0.2789 | Active MAE=1.2495 | Active R2=0.0218
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 34/500 | Train Loss=0.2692 (cls=0.2193, reg=0.0500) | Val Loss=0.8871 | Val F1=0.6821 | Val PR-AUC=0.6966 | Val MAE=0.2834 | Active MAE=1.2263 | Active R2=0.0553
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 35/500 | Train Loss=0.2677 (cls=0.2155, reg=0.0522) | Val Loss=0.9406 | Val F1=0.6744 | Val PR-AUC=0.6900 | Val MAE=0.2804 | Active MAE=1.2288 | Active R2=0.0452
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 36/500 | Train Loss=0.2706 (cls=0.2167, reg=0.0540) | Val Loss=0.9016 | Val F1=0.6908 | Val PR-AUC=0.7117 | Val MAE=0.2755 | Active MAE=1.2306 | Active R2=0.0243
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 37/500 | Train Loss=0.2581 (cls=0.2074, reg=0.0507) | Val Loss=0.8924 | Val F1=0.7018 | Val PR-AUC=0.7079 | Val MAE=0.2757 | Active MAE=1.2149 | Active R2=0.0587
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 38/500 | Train Loss=0.2670 (cls=0.2144, reg=0.0526) | Val Loss=0.8890 | Val F1=0.6833 | Val PR-AUC=0.7025 | Val MAE=0.2788 | Active MAE=1.2151 | Active R2=0.0600
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 39/500 | Train Loss=0.2648 (cls=0.2102, reg=0.0546) | Val Loss=0.9356 | Val F1=0.6817 | Val PR-AUC=0.6848 | Val MAE=0.2819 | Active MAE=1.2279 | Active R2=0.0505
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 40/500 | Train Loss=0.2588 (cls=0.2058, reg=0.0530) | Val Loss=0.9161 | Val F1=0.6716 | Val PR-AUC=0.6946 | Val MAE=0.2770 | Active MAE=1.2188 | Active R2=0.0496
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 41/500 | Train Loss=0.2449 (cls=0.1929, reg=0.0520) | Val Loss=0.9358 | Val F1=0.6826 | Val PR-AUC=0.6922 | Val MAE=0.2797 | Active MAE=1.2164 | Active R2=0.0593
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 42/500 | Train Loss=0.2512 (cls=0.2021, reg=0.0491) | Val Loss=0.9249 | Val F1=0.6831 | Val PR-AUC=0.6969 | Val MAE=0.2791 | Active MAE=1.2254 | Active R2=0.0484
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 43/500 | Train Loss=0.2472 (cls=0.1953, reg=0.0519) | Val Loss=0.9427 | Val F1=0.6824 | Val PR-AUC=0.6922 | Val MAE=0.2801 | Active MAE=1.2219 | Active R2=0.0501
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 44/500 | Train Loss=0.2415 (cls=0.1919, reg=0.0496) | Val Loss=0.9335 | Val F1=0.6774 | Val PR-AUC=0.6910 | Val MAE=0.2809 | Active MAE=1.2202 | Active R2=0.0550
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 45/500 | Train Loss=0.2428 (cls=0.1942, reg=0.0486) | Val Loss=0.9546 | Val F1=0.6845 | Val PR-AUC=0.6978 | Val MAE=0.2817 | Active MAE=1.2312 | Active R2=0.0584
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 46/500 | Train Loss=0.2463 (cls=0.1933, reg=0.0530) | Val Loss=0.9575 | Val F1=0.6873 | Val PR-AUC=0.6910 | Val MAE=0.2784 | Active MAE=1.2256 | Active R2=0.0427
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 47/500 | Train Loss=0.2461 (cls=0.1937, reg=0.0524) | Val Loss=0.9780 | Val F1=0.6815 | Val PR-AUC=0.6861 | Val MAE=0.2782 | Active MAE=1.2262 | Active R2=0.0403
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 48/500 | Train Loss=0.2362 (cls=0.1871, reg=0.0491) | Val Loss=0.9656 | Val F1=0.6846 | Val PR-AUC=0.6938 | Val MAE=0.2786 | Active MAE=1.2273 | Active R2=0.0477
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 49/500 | Train Loss=0.2362 (cls=0.1868, reg=0.0493) | Val Loss=0.9712 | Val F1=0.6865 | Val PR-AUC=0.6884 | Val MAE=0.2814 | Active MAE=1.2254 | Active R2=0.0582
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 50/500 | Train Loss=0.2303 (cls=0.1816, reg=0.0486) | Val Loss=0.9622 | Val F1=0.6845 | Val PR-AUC=0.6903 | Val MAE=0.2786 | Active MAE=1.2234 | Active R2=0.0536
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 51/500 | Train Loss=0.2269 (cls=0.1784, reg=0.0485) | Val Loss=0.9663 | Val F1=0.6915 | Val PR-AUC=0.6901 | Val MAE=0.2797 | Active MAE=1.2291 | Active R2=0.0488
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 52/500 | Train Loss=0.2284 (cls=0.1802, reg=0.0481) | Val Loss=0.9549 | Val F1=0.6893 | Val PR-AUC=0.6888 | Val MAE=0.2803 | Active MAE=1.2194 | Active R2=0.0636
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 53/500 | Train Loss=0.2278 (cls=0.1793, reg=0.0485) | Val Loss=0.9846 | Val F1=0.6925 | Val PR-AUC=0.6894 | Val MAE=0.2769 | Active MAE=1.2262 | Active R2=0.0447
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 54/500 | Train Loss=0.2282 (cls=0.1804, reg=0.0478) | Val Loss=0.9735 | Val F1=0.6885 | Val PR-AUC=0.6847 | Val MAE=0.2792 | Active MAE=1.2183 | Active R2=0.0600
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 55/500 | Train Loss=0.2245 (cls=0.1767, reg=0.0478) | Val Loss=0.9754 | Val F1=0.6908 | Val PR-AUC=0.6843 | Val MAE=0.2811 | Active MAE=1.2228 | Active R2=0.0566
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 56/500 | Train Loss=0.2268 (cls=0.1783, reg=0.0484) | Val Loss=0.9704 | Val F1=0.6890 | Val PR-AUC=0.6908 | Val MAE=0.2781 | Active MAE=1.2228 | Active R2=0.0504
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 57/500 | Train Loss=0.2294 (cls=0.1824, reg=0.0470) | Val Loss=0.9599 | Val F1=0.6909 | Val PR-AUC=0.6925 | Val MAE=0.2774 | Active MAE=1.2125 | Active R2=0.0635
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 58/500 | Train Loss=0.2281 (cls=0.1795, reg=0.0486) | Val Loss=0.9657 | Val F1=0.6877 | Val PR-AUC=0.6913 | Val MAE=0.2768 | Active MAE=1.2166 | Active R2=0.0568
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 59/500 | Train Loss=0.2211 (cls=0.1747, reg=0.0465) | Val Loss=0.9713 | Val F1=0.6979 | Val PR-AUC=0.6891 | Val MAE=0.2795 | Active MAE=1.2209 | Active R2=0.0587
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 60/500 | Train Loss=0.2255 (cls=0.1762, reg=0.0493) | Val Loss=0.9782 | Val F1=0.6929 | Val PR-AUC=0.6900 | Val MAE=0.2785 | Active MAE=1.2248 | Active R2=0.0509
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 61/500 | Train Loss=0.2273 (cls=0.1798, reg=0.0474) | Val Loss=0.9962 | Val F1=0.6900 | Val PR-AUC=0.6857 | Val MAE=0.2785 | Active MAE=1.2220 | Active R2=0.0514
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 62/500 | Train Loss=0.2234 (cls=0.1764, reg=0.0470) | Val Loss=0.9926 | Val F1=0.6899 | Val PR-AUC=0.6847 | Val MAE=0.2786 | Active MAE=1.2220 | Active R2=0.0522
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+Epoch 63/500 | Train Loss=0.2230 (cls=0.1733, reg=0.0497) | Val Loss=0.9849 | Val F1=0.6878 | Val PR-AUC=0.6833 | Val MAE=0.2794 | Active MAE=1.2227 | Active R2=0.0533
+Early Stopping at Epoch 63
+
+训练结束，最佳验证损失：0.639281
+/data/AIPD/miniconda3/envs/R2/lib/python3.11/site-packages/torch/nn/modules/transformer.py:562: UserWarning: Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly. (Triggered internally at ../aten/src/ATen/native/transformers/attention.cpp:150.)
+  return torch._transformer_encoder_layer_fwd(
+
+========== TEST RESULTS ==========
+Loss: 0.7070213120542778
+Accuracy: 0.8506705328017398
+Precision: 0.5812807881773399
+Recall: 0.8676470588235294
+F1: 0.696165191740413
+ROC_AUC: 0.931982804408445
+PR_AUC: 0.7586875332585322
+MAE: 0.3224537968635559
+RMSE: 1.0435551627127873
+R2: 0.28946447372436523
+Active_MAE: 1.1908445358276367
+Active_RMSE: 2.183055395048216
+Active_R2: 0.2016991376876831
+Active_Spearman: 0.5323239037929873
+测试集预测结果已保存！
