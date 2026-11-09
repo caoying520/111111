@@ -9,25 +9,14 @@ import numpy as np
 import pandas as pd
 import pickle
 from tqdm import tqdm
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from scipy.stats import pearsonr
-import heapq
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import (
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score,
-    roc_auc_score,
-    average_precision_score,
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score
-)
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import ndcg_score
+
 # ========================
 # 1️⃣ 固定随机种子
 # ========================
@@ -38,81 +27,80 @@ def set_seed(seed=123):
     torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
 
+
 # ========================
 # 2️⃣ Dataset 定义
 # ========================
 class EnzymeSubstrateDataset(Dataset):
-    def __init__(self, df, esm_embeds, mol_embeds1,mol_embeds2,threshold=0.03):
-        """
-        df: pandas.DataFrame, must include columns:
-            - name (key to esm_embeds)
-            - SMILES (key to mol_embeds)
-            - Conv (label)
-            - SM_norm (归一化后的底物浓度)
-            - Enz_norm (归一化后的酶浓度)
-        esm_embeds: dict[name] -> {"emb": tensor[L, d], "mask": tensor[L]}
-        mol_embeds: dict[smiles] -> vector (numpy/torch)
-        """
+    def __init__(self, df, esm_embeds, mol_embeds1, mol_embeds2):
         self.df = df.reset_index(drop=True)
-        self.idx = df["Name"].astype(str).tolist()
-        self.smiles1 = df["SM_胺"].tolist()
-        self.smiles2 = df["SM_酮"].tolist()
-        # self.labels = df["Activity"].astype(float).tolist()
-        self.labels = pd.to_numeric(self.df['Activity'],errors="coerce").fillna(0).astype(float).to_numpy()
+
+        self.idx = self.df["Name"].astype(str).tolist()
+        self.smiles1 = self.df["SM_胺"].tolist()
+        self.smiles2 = self.df["SM_酮"].tolist()
+
+        self.labels = pd.to_numeric(
+            self.df["Activity"], errors="coerce"
+        ).fillna(0).astype(float).to_numpy()
+
         n_neg_label = int((self.labels < 0).sum())
         if n_neg_label:
-            print(f"⚠️ 标签中有 {n_neg_label} 条负值 Activity，已截断为 0（按无活性处理）")
-        self.labels =np.clip(self.labels,0.0,None)
+            print(f"⚠️ 标签中有 {n_neg_label} 条负值 Activity，已截断为 0")
+        self.labels = np.clip(self.labels, 0.0, None)
+
         self.esm_embeds = esm_embeds
         self.mol_embeds1 = mol_embeds1
         self.mol_embeds2 = mol_embeds2
-        self.threshold = threshold
-
-        # # 归一化后浓度列（log+zscore，在 main() 中计算）
-        # if "SM_norm" not in df.columns or "Enz_norm" not in df.columns:
-        #     raise ValueError("DataFrame must contain 'SM_norm' and 'Enz_norm' columns.")
-        # self.sm_norm = df["SM_norm"].astype(float).tolist()
-        # self.enzyme_norm = df["Enz_norm"].astype(float).tolist()
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, i):
         idx = self.idx[i]
-        esm_data = self.esm_embeds[idx]  # {"emb": tensor, "mask": tensor}
-        esm_emb = esm_data["emb"].float()    # e.g. [L, d]
-        esm_mask = esm_data["mask"].long()   # e.g. [L]
-        mol_feat1 = torch.tensor(self.mol_embeds1[self.smiles1[i]], dtype=torch.float32)
-        mol_feat2 = torch.tensor(self.mol_embeds2[self.smiles2[i]], dtype=torch.float32)
+
+        esm_data = self.esm_embeds[idx]
+        esm_emb = esm_data["emb"].float()
+        esm_mask = esm_data["mask"].long()
+
+        mol_feat1 = torch.tensor(
+            self.mol_embeds1[self.smiles1[i]], dtype=torch.float32
+        )
+        mol_feat2 = torch.tensor(
+            self.mol_embeds2[self.smiles2[i]], dtype=torch.float32
+        )
 
         activity = float(self.labels[i])
-        #分类标签
-        cls_label = float(activity >= self.threshold)
-        #回归标签
-        reg_label = float(np.log1p(activity))  # 浓度：归一化后的标量，保持 shape [1]
-        #仅有效活性样本参与回归
-        reg_mask =float(activity >= self.threshold)  
-        
-        # sm_load = torch.tensor([self.sm_norm[i]], dtype=torch.float32)
-        # enz_load = torch.tensor([self.enzyme_norm[i]], dtype=torch.float32)
 
-        # label = torch.tensor(self.labels[i], dtype=torch.float32)
-        return esm_emb, esm_mask, mol_feat1, mol_feat2, torch.tensor(cls_label,dtype=torch.float32), torch.tensor(reg_label,dtype=torch.float32), torch.tensor(reg_mask),torch.tensor(activity,dtype=torch.float32)
+        # 回归标签：log1p(Activity)，零值对应标签0
+        reg_label = float(np.log1p(activity))
+
+        return (
+            esm_emb,
+            esm_mask,
+            mol_feat1,
+            mol_feat2,
+            torch.tensor(reg_label, dtype=torch.float32),
+            torch.tensor(activity, dtype=torch.float32)
+        )
+
 
 # ========================
-# 3️⃣ 模型定义（包含两个浓度的 1->128 映射）
+# 3️⃣ 模型定义
 # ========================
 class EnzymeSubstrateRegressor(nn.Module):
-    def __init__(self, esm_dim=1280, mol_dim=768, dropout=0.1, hidden_dim=256):
+    def __init__(self, esm_dim=1280, mol_dim=768,
+                 dropout=0.25, hidden_dim=256):
         super().__init__()
-        # ESM projection: esm_dim -> 256 (via 512 -> 256)
+
+        # ESM projection
         self.esm_proj = nn.Sequential(
             nn.Linear(esm_dim, 512),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(512, 256),
         )
-        # Mol projection: mol_dim -> 256
+
+        # Mol projection 1
         self.mol_proj1 = nn.Sequential(
             nn.Linear(mol_dim, 512),
             nn.ReLU(),
@@ -120,6 +108,7 @@ class EnzymeSubstrateRegressor(nn.Module):
             nn.Linear(512, 256),
         )
 
+        # Mol projection 2
         self.mol_proj2 = nn.Sequential(
             nn.Linear(mol_dim, 512),
             nn.ReLU(),
@@ -127,342 +116,318 @@ class EnzymeSubstrateRegressor(nn.Module):
             nn.Linear(512, 256),
         )
 
-        # Transformer encoder for esm sequence tokens (keeps d_model=256)
+        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=256, nhead=8, dim_feedforward=512, dropout=dropout, batch_first=True
+            d_model=256,
+            nhead=8,
+            dim_feedforward=512,
+            dropout=dropout,
+            batch_first=True
         )
-        # enable_nested_tensor=False：关闭嵌套张量快路径，
-        # 否则带 padding mask 时输出长度会被截到"本 batch 最长有效序列"（如 325），
-        # 与固定长度 400 的 mask 对不上，masked-mean-pooling 会报尺寸不匹配
+
         self.esm_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=2, enable_nested_tensor=False
+            encoder_layer,
+            num_layers=2,
+            enable_nested_tensor=False
         )
 
-        # # 浓度投影：1 -> 64 -> 128（分别为 SM 和 Enzyme）
-        # self.sm_proj = nn.Sequential(
-        #     nn.Linear(1, 64),
-        #     nn.ReLU(),
-        #     nn.Linear(64, 128),
-        #     nn.LayerNorm(128)
-        # )
-        # self.enz_proj = nn.Sequential(
-        #     nn.Linear(1, 64),
-        #     nn.ReLU(),
-        #     nn.Linear(64, 128),
-        #     nn.LayerNorm(128)
-        # )
-
-        # 全连接层：输入维度 256 + 256 + 128 + 128 = 768
-        # input_dim = 256 + 256 + 128 + 128
+        # 全连接层
         input_dim = 256 + 256 + 256
+
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
+
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.bn2 = nn.BatchNorm1d(hidden_dim)
+
         self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.bn3 = nn.BatchNorm1d(hidden_dim // 2)
+
         self.dropout = nn.Dropout(dropout)
-        #分类头
-        self.cls_head = nn.Linear(hidden_dim // 2, 1)
-        #回归头
+
+        # 只有一个回归头
         self.reg_head = nn.Linear(hidden_dim // 2, 1)
-        # self.fc4 = nn.Linear(hidden_dim // 2, 1)
-        # self.dropout = nn.Dropout(0.2)
 
     def forward(self, esm_feat, esm_mask, mol_feat1, mol_feat2):
-        # esm_feat: [B, L, esm_dim]  (if loaded as [L, d] per sample, DataLoader must batch consistently)
-        # esm_mask: [B, L]
-        # mol_feat: [B, mol_dim]
-        # sm_load, enz_load: [B, 1]
 
-        # Project token features
-        esm_feat = self.esm_proj(esm_feat)  # [B, L, 256]
+        # ESM projection
+        esm_feat = self.esm_proj(esm_feat)
 
-        # Build src_key_padding_mask for Transformer: True where padding (mask==0)
-        src_mask = esm_mask == 0  # [B, L] bool
+        # Transformer mask
+        src_mask = esm_mask == 0
 
-        # Transformer Encoder
-        esm_feat = self.esm_encoder(esm_feat, src_key_padding_mask=src_mask)  # [B, L, 256]
+        esm_feat = self.esm_encoder(
+            esm_feat,
+            src_key_padding_mask=src_mask
+        )
 
-        # Masked mean pooling over sequence length
-        mask_expanded = esm_mask.unsqueeze(-1).float()  # [B, L, 1]
-        denom = mask_expanded.sum(dim=1) + 1e-8  # [B, 1]
-        esm_pooled = (esm_feat * mask_expanded).sum(dim=1) / denom  # [B, 256]
+        # Masked mean pooling
+        mask_expanded = esm_mask.unsqueeze(-1).float()
+        denom = mask_expanded.sum(dim=1) + 1e-8
+
+        esm_pooled = (
+            (esm_feat * mask_expanded).sum(dim=1) / denom
+        )
 
         # Mol projection
-        mol_proj1 = self.mol_proj1(mol_feat1)  # [B, 256]
-        mol_proj2 = self.mol_proj2(mol_feat2)  # [B, 256]
+        mol_proj1 = self.mol_proj1(mol_feat1)
+        mol_proj2 = self.mol_proj2(mol_feat2)
 
-        # # Concentration projections
-        # sm_proj = self.sm_proj(sm_load)   # [B, 128]
-        # enz_proj = self.enz_proj(enz_load)  # [B, 128]
-
-        # Concat all
-        # x = torch.cat([esm_pooled, enz_proj, mol_proj, sm_proj], dim=-1)  # [B, 768]
-
-        x = torch.cat([esm_pooled, mol_proj1, mol_proj2], dim=-1)  # [B, 768 + 256 + 256]
+        # Feature fusion
+        x = torch.cat(
+            [esm_pooled, mol_proj1, mol_proj2],
+            dim=-1
+        )
 
         # FC blocks with residual
         x = F.relu(self.bn1(self.fc1(x)))
+
         residual = x
+
         x = F.relu(self.bn2(self.fc2(x)))
         x = self.dropout(x)
         x = x + residual
+
         x = F.relu(self.bn3(self.fc3(x)))
+        x = self.dropout(x)
 
-        x=self.dropout(x)
-        cls_pred = self.cls_head(x).squeeze(-1)  # [B, 1]
-        reg_pred = self.reg_head(x).squeeze(-1)  # [B, 1]
-        # x = self.fc4(x)  # [B, 1]
-        # return x.squeeze(-1)  # [B]
-        return cls_pred, reg_pred
+        # Regression output
+        reg_pred = self.reg_head(x).squeeze(-1)
 
-# 多任务损失函数
-# class MultiTaskLoss(nn.Module):
-#     def __init__(self, pos_weight=4.0,lambda_cls=1.0,lambda_reg=1.0):
+        return reg_pred
 
-#         super().__init__()
-
-#         self.register_buffer("pos_weight",torch.tensor(float(pos_weight)))
-#         self.lambda_cls = lambda_cls
-#         self.lambda_reg = lambda_reg
-#         self.cls_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
-
-#         self.reg_loss = nn.SmoothL1Loss(reduction="none")
-
-#     def forward(self, cls_logits, reg_output,
-#                 cls_target, reg_target, reg_mask):
-
-#         # 分类损失：全部样本
-#         loss_cls = self.cls_loss(cls_logits, cls_target)
-#         # 回归损失：仅有效活性样本
-#         loss_reg_each = self.reg_loss(reg_output, reg_target)
-#         loss_reg = (loss_reg_each * reg_mask).sum() / reg_mask.sum().clamp_min(1.0)
-
-#         loss = (self.lambda_cls * loss_cls+ self.lambda_reg * loss_reg)
-
-#         return loss, loss_cls, loss_reg
-class MultiTaskLoss(nn.Module):
-    def __init__(self, pos_weight=4.0,
-                 lambda_cls=1.0, lambda_reg=1.0):
-        super().__init__()
-
-        self.register_buffer(
-            "pos_weight", torch.tensor(float(pos_weight))
-        )
-
-        self.lambda_cls = lambda_cls
-        self.lambda_reg = lambda_reg
-
-        self.cls_loss = nn.BCEWithLogitsLoss(
-            pos_weight=self.pos_weight,
-            reduction="none"
-        )
-
-        self.reg_loss = nn.SmoothL1Loss(
-            reduction="none"
-        )
-
-    def forward(self, cls_logits, reg_output,
-                cls_target, reg_target, reg_mask):
-
-        cls_each = self.cls_loss(cls_logits, cls_target)
-
-        loss_cls = cls_each.mean()
-
-        reg_each = self.reg_loss(reg_output, reg_target)
-
-        loss_reg = (
-            (reg_each * reg_mask).sum()
-            / reg_mask.sum().clamp_min(1.0)
-        )
-
-        loss = (
-            self.lambda_cls * loss_cls
-            + self.lambda_reg * loss_reg
-        )
-
-        return loss, loss_cls, loss_reg
 
 # ========================
-# 4️⃣ 评估函数（与原脚本保持一致）
+# 4️⃣ 评估函数
 # ========================
-def evaluate(model, loader, device, criterion=None,threshold=0.03):
+def evaluate(model, loader, device, criterion=None):
+
     model.eval()
-    all_cls, all_reg = [], []
-    all_cls_y, all_reg_y = [], []
+
+    all_reg = []
+    all_reg_y = []
     all_raw_y = []
+
     total_loss = 0.0
     total_samples = 0
-    total_cls_loss = 0.0
-    total_reg_loss = 0.0
-    total_active = 0
+
     with torch.no_grad():
+
         for batch in loader:
-            (esm_feat, esm_mask, mol_feat1, mol_feat2,cls_y, reg_y, reg_mask, raw_y) = batch
+
+            (esm_feat, esm_mask, mol_feat1, mol_feat2,
+             reg_y, raw_y) = batch
+
             esm_feat = esm_feat.to(device)
             esm_mask = esm_mask.to(device)
             mol_feat1 = mol_feat1.to(device)
             mol_feat2 = mol_feat2.to(device)
-            cls_y = cls_y.to(device)
             reg_y = reg_y.to(device)
-            reg_mask = reg_mask.to(device)
 
-            cls_logits, reg_output = model(esm_feat, esm_mask, mol_feat1, mol_feat2)
+            reg_output = model(
+                esm_feat, esm_mask, mol_feat1, mol_feat2
+            )
+
             if criterion is not None:
-                loss, _, _ = criterion(cls_logits, reg_output,cls_y, reg_y, reg_mask)
+                loss = criterion(reg_output, reg_y)
+
                 total_loss += loss.item() * len(raw_y)
                 total_samples += len(raw_y)
 
-            cls_prob = torch.sigmoid(cls_logits)
+            # log1p(Activity) 还原到原始活性尺度
+            reg_pred = torch.expm1(
+                reg_output.clamp(min=0, max=10)
+            )
 
-            # log1p(Activity) 转换回原始活性尺度
-            reg_pred = torch.expm1(reg_output.clamp(min=0, max=10))
-            # 期望活性估计
-            expected_activity = cls_prob * reg_pred
-
-            all_cls.extend(cls_prob.cpu().numpy())
             all_reg.extend(reg_pred.cpu().numpy())
-            all_cls_y.extend(cls_y.cpu().numpy())
             all_reg_y.extend(reg_y.cpu().numpy())
             all_raw_y.extend(raw_y.cpu().numpy())
 
-    all_cls = np.array(all_cls)
     all_reg = np.array(all_reg)
     all_raw_y = np.array(all_raw_y)
 
-    all_cls_y = np.array(all_cls_y).astype(int)
-
-    expected_activity = all_cls * all_reg
-
-    # 分类指标
-    pred_class = (all_cls >= 0.5).astype(int)
-
-    acc = accuracy_score(all_cls_y, pred_class)
-    precision = precision_score(all_cls_y, pred_class, zero_division=0)
-    recall = recall_score(all_cls_y, pred_class, zero_division=0)
-    f1 = f1_score(all_cls_y, pred_class, zero_division=0)
-
-    if len(np.unique(all_cls_y)) == 2:
-        auc = roc_auc_score(all_cls_y, all_cls)
-        pr_auc = average_precision_score(all_cls_y, all_cls)
-    else:
-        auc, pr_auc = np.nan, np.nan
-
-    # 原始活性尺度下的整体预测
-    mse = mean_squared_error(all_raw_y, expected_activity)
+    # 整体回归指标
+    mse = mean_squared_error(all_raw_y, all_reg)
     rmse = np.sqrt(mse)
-    mae = mean_absolute_error(all_raw_y, expected_activity)
-    r2 = r2_score(all_raw_y, expected_activity)
+    mae = mean_absolute_error(all_raw_y, all_reg)
+    r2 = r2_score(all_raw_y, all_reg)
 
-    # 只评价真实有效活性样本的条件回归能力
-    active_mask = all_raw_y >= threshold
+    # 整体 Spearman 排序相关性
+    if len(np.unique(all_raw_y)) > 1:
+        overall_spearman = spearmanr(
+            all_raw_y, all_reg
+        ).statistic
+    else:
+        overall_spearman = np.nan
+
+    # 只评价真实非零活性样本
+    active_mask = all_raw_y > 0
 
     if active_mask.sum() > 1:
-        active_mae = mean_absolute_error(all_raw_y[active_mask],all_reg[active_mask])
-        active_rmse = np.sqrt(mean_squared_error(all_raw_y[active_mask],all_reg[active_mask]))
-        active_r2 = r2_score(all_raw_y[active_mask],all_reg[active_mask])
-        active_spearman = spearmanr(all_raw_y[active_mask],all_reg[active_mask]).statistic
+
+        active_mae = mean_absolute_error(
+            all_raw_y[active_mask],
+            all_reg[active_mask]
+        )
+
+        active_rmse = np.sqrt(
+            mean_squared_error(
+                all_raw_y[active_mask],
+                all_reg[active_mask]
+            )
+        )
+
+        active_r2 = r2_score(
+            all_raw_y[active_mask],
+            all_reg[active_mask]
+        )
+
+        active_spearman = spearmanr(
+            all_raw_y[active_mask],
+            all_reg[active_mask]
+        ).statistic
+
     else:
         active_mae = np.nan
         active_rmse = np.nan
         active_r2 = np.nan
         active_spearman = np.nan
-    avg_loss = (total_loss / total_samples if criterion is not None else None)
+
+    # Top100 排序指标
+    k = min(100, len(all_raw_y))
+
+    true_top_idx = np.argsort(-all_raw_y)[:k]
+    pred_top_idx = np.argsort(-all_reg)[:k]
+
+    overlap = len(
+        set(true_top_idx).intersection(set(pred_top_idx))
+    ) / k
+
+    # NDCG@100
+    ndcg100 = ndcg_score(
+        all_raw_y.reshape(1, -1),
+        all_reg.reshape(1, -1),
+        k=k
+    )
+
+    pred_top_activity = all_raw_y[pred_top_idx]
+
+    top100_true_mean = np.mean(pred_top_activity)
+    top100_true_median = np.median(pred_top_activity)
+
+    avg_loss = (
+        total_loss / total_samples
+        if criterion is not None else None
+    )
 
     metrics = {
         "Loss": avg_loss,
-        "Accuracy": acc,
-        "Precision": precision,
-        "Recall": recall,
-        "F1": f1,
-        "ROC_AUC": auc,
-        "PR_AUC": pr_auc,
         "MAE": mae,
         "RMSE": rmse,
         "R2": r2,
+        "Spearman": overall_spearman,
         "Active_MAE": active_mae,
         "Active_RMSE": active_rmse,
         "Active_R2": active_r2,
-        "Active_Spearman": active_spearman
+        "Active_Spearman": active_spearman,
+        "NDCG@100": ndcg100,
+        "Top100_Overlap": overlap,
+        "Top100_True_Mean": top100_true_mean,
+        "Top100_True_Median": top100_true_median
     }
 
     predictions = {
         "true": all_raw_y,
-        "prob": all_cls,
-        "conditional_activity": all_reg,
-        "expected_activity": expected_activity
+        "pred_activity": all_reg
     }
 
     return metrics, predictions
 
 
 # ========================
-# 5️⃣ 训练函数（保存 top-5 + best）
+# 5️⃣ 训练函数
 # ========================
-def train_model(train_loader,val_loader,model,optimizer,criterion,device,epochs=300,patience=30):
+def train_model(train_loader, val_loader, model,
+                optimizer, criterion, device,
+                epochs=500, patience=50):
 
-    model_dir = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/model_activity_Activity"
+    model_dir = (
+        "/data/AIPD/R2/enzyme_交接20260609/"
+        "enzyme_train/IRED/model_activity_regression"
+    )
+
     os.makedirs(model_dir, exist_ok=True)
+
     best_val_loss = float("inf")
     patience_counter = 0
 
     history = []
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=0.5,
         patience=8,
-        min_lr=1e-6)
+        min_lr=1e-6
+    )
 
     for epoch in range(epochs):
+
         model.train()
+
         total_loss = 0.0
-        total_cls = 0.0
-        total_reg = 0.0
 
         for batch in train_loader:
-            (esm_feat, esm_mask, mol_feat1, mol_feat2,cls_y, reg_y, reg_mask, raw_y) = batch
+
+            (esm_feat, esm_mask, mol_feat1, mol_feat2,
+             reg_y, raw_y) = batch
+
             esm_feat = esm_feat.to(device)
             esm_mask = esm_mask.to(device)
             mol_feat1 = mol_feat1.to(device)
             mol_feat2 = mol_feat2.to(device)
-
-            cls_y = cls_y.to(device)
             reg_y = reg_y.to(device)
-            reg_mask = reg_mask.to(device)
 
-            cls_logits, reg_output = model(esm_feat, esm_mask, mol_feat1, mol_feat2)
+            reg_output = model(
+                esm_feat, esm_mask, mol_feat1, mol_feat2
+            )
 
-            loss, loss_cls, loss_reg = criterion(cls_logits,reg_output,cls_y,reg_y,reg_mask)
+            loss = criterion(reg_output, reg_y)
+
             optimizer.zero_grad(set_to_none=True)
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=1.0
+            )
+
             optimizer.step()
 
             total_loss += loss.item()
-            total_cls += loss_cls.item()
-            total_reg += loss_reg.item()
 
-        n_batch = len(train_loader)
-        train_loss = total_loss / n_batch
-        train_cls = total_cls / n_batch
-        train_reg = total_reg / n_batch
+        train_loss = total_loss / max(len(train_loader), 1)
 
         # 验证
-        val_metrics, val_pred = evaluate(model, val_loader, device, criterion)
+        val_metrics, val_pred = evaluate(
+            model, val_loader, device, criterion
+        )
+
         val_loss = val_metrics["Loss"]
+
         scheduler.step(val_loss)
 
         print(
             f"Epoch {epoch+1}/{epochs} | "
-            f"Train Loss={train_loss:.4f} (cls={train_cls:.4f}, reg={train_reg:.4f}) | "
+            f"Train Loss={train_loss:.4f} | "
             f"Val Loss={val_loss:.4f} | "
-            f"Val F1={val_metrics['F1']:.4f} | "
-            f"Val PR-AUC={val_metrics['PR_AUC']:.4f} | "
             f"Val MAE={val_metrics['MAE']:.4f} | "
-            f"Active MAE={val_metrics['Active_MAE']:.4f} | "
-            f"Active R2={val_metrics['Active_R2']:.4f}"
+            f"Val RMSE={val_metrics['RMSE']:.4f} | "
+            f"Val R2={val_metrics['R2']:.4f} | "
+            f"Val Spearman={val_metrics['Spearman']:.4f} | "
+            f"Active Spearman={val_metrics['Active_Spearman']:.4f} | "
+            f"NDCG@100={val_metrics['NDCG@100']:.4f} | "
+            f"Top100 Overlap={val_metrics['Top100_Overlap']:.4f}"
         )
 
         history.append({
@@ -476,127 +441,338 @@ def train_model(train_loader,val_loader,model,optimizer,criterion,device,epochs=
 
         # 保存最佳模型
         if val_loss < best_val_loss:
+
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(),os.path.join(model_dir, "best_model.pth"))
+
+            torch.save(
+                model.state_dict(),
+                os.path.join(model_dir, "best_model.pth")
+            )
+
             print("保存最佳模型！")
+
         else:
             patience_counter += 1
+
         if patience_counter >= patience:
+
             print(f"Early Stopping at Epoch {epoch+1}")
             break
 
-    pd.DataFrame(history).to_csv(os.path.join(model_dir, "training_history.csv"),index=False)
+    pd.DataFrame(history).to_csv(
+        os.path.join(model_dir, "training_history.csv"),
+        index=False
+    )
 
     print(f"\n训练结束，最佳验证损失：{best_val_loss:.6f}")
+
 
 # ========================
 # 6️⃣ 主程序
 # ========================
 def main():
+
     set_seed(123)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Using device:", device)
 
     # ---------- 加载特征（ESM & Mol） ----------
-    esm_pkl = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/Feature/esm_feats_emb_mask.pkl"
-    mol_pkl1 = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/Feature/SM_胺.pkl"
-    mol_pkl2 = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/Feature/SM_酮.pkl"
+    esm_pkl = (
+        "/data/AIPD/R2/enzyme_交接20260609/"
+        "enzyme_train/IRED/Feature/esm_feats_emb_mask.pkl"
+    )
+
+    mol_pkl1 = (
+        "/data/AIPD/R2/enzyme_交接20260609/"
+        "enzyme_train/IRED/Feature/SM_胺.pkl"
+    )
+
+    mol_pkl2 = (
+        "/data/AIPD/R2/enzyme_交接20260609/"
+        "enzyme_train/IRED/Feature/SM_酮.pkl"
+    )
+
     with open(esm_pkl, "rb") as f:
         esm_dict = pickle.load(f)
+
     with open(mol_pkl1, "rb") as f:
         mol_dict1 = pickle.load(f)
+
     with open(mol_pkl2, "rb") as f:
         mol_dict2 = pickle.load(f)
-        
-    print(f"✅ 已加载 ESM 特征: {len(esm_dict)} 条 | MolFormer 特征: {len(mol_dict1)} 条 | MolFormer 特征: {len(mol_dict2)} 条")
 
-    # ---------- 数据划分（使用你已有的 split txt） ----------
-    split_dir = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/split_data_Activaty"
+    print(
+        f"✅ 已加载 ESM 特征: {len(esm_dict)} 条 | "
+        f"MolFormer 特征: {len(mol_dict1)} 条 | "
+        f"MolFormer 特征: {len(mol_dict2)} 条"
+    )
+
+    # ---------- 数据划分（使用已有的三个 txt） ----------
+    split_dir = (
+        "/data/AIPD/R2/enzyme_交接20260609/"
+        "enzyme_train/IRED/split_data_Activaty"
+    )
+
     with open(os.path.join(split_dir, "train.txt")) as f:
         train_idx = [line.strip() for line in f if line.strip()]
+
     with open(os.path.join(split_dir, "val.txt")) as f:
         val_idx = [line.strip() for line in f if line.strip()]
+
     with open(os.path.join(split_dir, "test.txt")) as f:
         test_idx = [line.strip() for line in f if line.strip()]
+
     # ---------- 数据读取 ----------
-    csv_path = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/train_Activity_std2.csv"
+    csv_path = (
+        "/data/AIPD/R2/enzyme_交接20260609/"
+        "enzyme_train/IRED/train_Activity_std2.csv"
+    )
+
     df = pd.read_csv(csv_path)
+
     print("Loaded df:", df.shape)
+
     df["idx"] = df["idx"].astype(str)
-    df_train = df[df["idx"].isin(train_idx)].reset_index(drop=True)
-    df_val = df[df["idx"].isin(val_idx)].reset_index(drop=True)
-    df_test = df[df["idx"].isin(test_idx)].reset_index(drop=True)
-    print(f"📂 数据集大小: train={len(df_train)}, val={len(df_val)}, test={len(df_test)}")
 
-    # SM_COL = "SM loading (g/L)"
-    # ENZ_COL = "Enzyme loading (g/L)"
+    df_train = df[
+        df["idx"].isin(train_idx)
+    ].reset_index(drop=True)
 
-    # for d in [df_train, df_val, df_test]:
-    #     d[SM_COL] = pd.to_numeric(d[SM_COL], errors="coerce").fillna(0.0).clip(lower=0.0)
-    #     d[ENZ_COL] = pd.to_numeric(d[ENZ_COL], errors="coerce").fillna(0.0).clip(lower=0.0)
-        # d["SM_log"] = np.log1p(d[SM_COL].astype(float))
-        # d["Enz_log"] = np.log1p(d[ENZ_COL].astype(float))
+    df_val = df[
+        df["idx"].isin(val_idx)
+    ].reset_index(drop=True)
 
-    # sm_mean = df_train["SM_log"].mean()
-    # sm_std = df_train["SM_log"].std() + 1e-12
-    # enz_mean = df_train["Enz_log"].mean()
-    # enz_std = df_train["Enz_log"].std() + 1e-12
+    df_test = df[
+        df["idx"].isin(test_idx)
+    ].reset_index(drop=True)
 
-    # for d in [df_train, df_val, df_test]:
-    #     d["SM_norm"] = (d["SM_log"] - sm_mean) / sm_std
-    #     d["Enz_norm"] = (d["Enz_log"] - enz_mean) / enz_std
+    print(
+        f"📂 原始数据集大小: "
+        f"train={len(df_train)}, "
+        f"val={len(df_val)}, "
+        f"test={len(df_test)}"
+    )
 
-    # print("SM_log mean/std (train):", sm_mean, sm_std)
-    # print("Enz_log mean/std (train):", enz_mean, enz_std)
+    # ---------- 训练集零值抽样 ----------
+    ZERO_KEEP_RATIO = 0.20
+
+    df_train["Activity"] = pd.to_numeric(
+        df_train["Activity"], errors="coerce"
+    ).fillna(0.0)
+
+    df_val["Activity"] = pd.to_numeric(
+        df_val["Activity"], errors="coerce"
+    ).fillna(0.0)
+
+    df_test["Activity"] = pd.to_numeric(
+        df_test["Activity"], errors="coerce"
+    ).fillna(0.0)
+
+    train_zero = df_train[
+        df_train["Activity"] == 0
+    ]
+
+    train_nonzero = df_train[
+        df_train["Activity"] != 0
+    ]
+
+    n_zero_keep = int(
+        round(len(train_zero) * ZERO_KEEP_RATIO)
+    )
+
+    df_train_zero_sampled = train_zero.sample(
+        n=n_zero_keep,
+        random_state=123
+    ) if n_zero_keep > 0 else train_zero.iloc[0:0]
+
+    df_train = pd.concat(
+        [train_nonzero, df_train_zero_sampled],
+        axis=0
+    ).sample(
+        frac=1,
+        random_state=123
+    ).reset_index(drop=True)
+
+    print("\n========== 训练集零值抽样结果 ==========")
+
+    print(
+        f"原始训练集: {len(train_nonzero) + len(train_zero)}"
+    )
+
+    print(f"全部非零样本: {len(train_nonzero)}")
+    print(f"原始零值样本: {len(train_zero)}")
+    print(f"保留零值样本: {len(df_train_zero_sampled)}")
+
+    print(f"抽样后训练集: {len(df_train)}")
+
+    print(
+        f"抽样后零值比例: "
+        f"{(df_train['Activity'] == 0).mean():.2%}"
+    )
+
+    # 保存实际参与训练的数据
+    model_dir = (
+        "/data/AIPD/R2/enzyme_交接20260609/"
+        "enzyme_train/IRED/model_activity_regression"
+    )
+
+    os.makedirs(model_dir, exist_ok=True)
+
+    df_train.to_csv(
+        os.path.join(model_dir, "train_sampled.csv"),
+        index=False
+    )
+
+    df_val.to_csv(
+        os.path.join(model_dir, "val_full.csv"),
+        index=False
+    )
+
+    df_test.to_csv(
+        os.path.join(model_dir, "test_full.csv"),
+        index=False
+    )
 
     # ---------- Dataset & DataLoader ----------
-    train_set = EnzymeSubstrateDataset(df_train, esm_dict, mol_dict1, mol_dict2, threshold=0.03)
-    val_set = EnzymeSubstrateDataset(df_val, esm_dict, mol_dict1, mol_dict2, threshold=0.03)
-    test_set = EnzymeSubstrateDataset(df_test, esm_dict, mol_dict1, mol_dict2, threshold=0.03)
+    train_set = EnzymeSubstrateDataset(
+        df_train, esm_dict, mol_dict1, mol_dict2
+    )
 
-    train_loader = DataLoader(train_set, batch_size=256, shuffle=True, num_workers=4, pin_memory=True,drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+    val_set = EnzymeSubstrateDataset(
+        df_val, esm_dict, mol_dict1, mol_dict2
+    )
+
+    test_set = EnzymeSubstrateDataset(
+        df_test, esm_dict, mol_dict1, mol_dict2
+    )
+
+    batch_size = 128
+
+    # 避免 BatchNorm 遇到最后一个只有1条数据的 batch
+    drop_last = (
+        len(train_set) % batch_size == 1
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=drop_last
+    )
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=256,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    test_loader = DataLoader(
+        test_set,
+        batch_size=256,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
 
     # ---------- 模型、优化器、损失 ----------
-    model = EnzymeSubstrateRegressor(esm_dim=1280, mol_dim=768, dropout=0.25, hidden_dim=256).to(device)
-    # Loss
-    n_pos = (df_train["Activity"] >= 0.03).sum()
-    n_neg = len(df_train) - n_pos
-    pos_weight = n_neg / max(n_pos, 1)
-    criterion = MultiTaskLoss(pos_weight=pos_weight,lambda_cls=1.0,lambda_reg=1.0).to(device)
-    print("Positive weight:", pos_weight)
+    model = EnzymeSubstrateRegressor(
+        esm_dim=1280,
+        mol_dim=768,
+        dropout=0.25,
+        hidden_dim=256
+    ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    # criterion = nn.MSELoss()
+    # 单一回归损失
+    criterion = nn.SmoothL1Loss(beta=0.5)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=5e-5,
+        weight_decay=1e-4
+    )
 
     # ---------- 训练 ----------
-    train_model(train_loader, val_loader, model, optimizer, criterion, device, epochs=500,patience=50)
+    train_model(
+        train_loader,
+        val_loader,
+        model,
+        optimizer,
+        criterion,
+        device,
+        epochs=500,
+        patience=30
+    )
 
     # ---------- 测试评估 ----------
-    best_model_path = "/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/model_activity_Activity/best_model.pth"
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    best_model_path = os.path.join(
+        model_dir, "best_model.pth"
+    )
+
+    model.load_state_dict(
+        torch.load(best_model_path, map_location=device)
+    )
+
     model.to(device)
 
-    test_metrics, test_predictions = evaluate(model,test_loader,device,criterion)
+    test_metrics, test_predictions = evaluate(
+        model,
+        test_loader,
+        device,
+        criterion
+    )
+
     print("\n========== TEST RESULTS ==========")
+
     for key, value in test_metrics.items():
         print(f"{key}: {value}")
 
-    # Save predictions
+    # ---------- 保存预测结果 ----------
     result_df = df_test.reset_index(drop=True).copy()
+
     result_df["True_Activity"] = test_predictions["true"]
-    result_df["Pred_Probability"] = test_predictions["prob"]
-    result_df["Pred_Conditional_Activity"] = (test_predictions["conditional_activity"])
-    result_df["Pred_Expected_Activity"] = (test_predictions["expected_activity"])
 
-    result_df.to_csv("/data/AIPD/R2/enzyme_交接20260609/enzyme_train/IRED/model_activity_Activity/test_predictions.csv",index=False)
-    print("测试集预测结果已保存！")
+    result_df["Pred_Activity"] = (
+        test_predictions["pred_activity"]
+    )
 
-    # test_loss, mse, rmse, mae, r2, pearson = evaluate(model, test_loader, device, criterion)
-    # print(f"\n🧪 Test | Loss={test_loss:.4f} | MSE={mse:.4f} | RMSE={rmse:.4f} | "
-    #       f"MAE={mae:.4f} | R2={r2:.4f} | Pearson={pearson:.4f}")
+    result_df["Abs_Error"] = abs(
+        result_df["True_Activity"] -
+        result_df["Pred_Activity"]
+    )
+
+    result_df = result_df.sort_values(
+        "Pred_Activity",
+        ascending=False
+    )
+
+    result_df.to_csv(
+        os.path.join(model_dir, "test_predictions.csv"),
+        index=False
+    )
+
+    # 保存测试集预测 Top100
+    result_df.head(100).to_csv(
+        os.path.join(model_dir, "test_top100.csv"),
+        index=False
+    )
+
+    # 保存测试集指标
+    pd.DataFrame(
+        [test_metrics]
+    ).to_csv(
+        os.path.join(model_dir, "test_metrics.csv"),
+        index=False
+    )
+
+    print("\n测试集预测结果已保存！")
+    print("测试集 Top100 已保存！")
+
 
 if __name__ == "__main__":
     main()
