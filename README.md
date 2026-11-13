@@ -1,202 +1,198 @@
 
 # -*- coding: utf-8 -*-
 
-import pandas as pd
+import os
+from copy import copy
 from openpyxl import load_workbook
-
-pred_csv = "/data/caoying/softwares/酶R2/enzyme_交接20260609/new_data_test/predictions_110KRD_SM96_std/best_model_add_preds.csv"
-smile_csv = "/data/caoying/softwares/酶R2/enzyme_交接20260609/new_data_test/96SM_std.csv"
-template_xlsx = "/data/caoying/softwares/酶R2/enzyme_交接20260609/new_data_test/110KRD&96底物实验结果与多模型综合分析_结果.xlsx"
-output_xlsx = "/data/caoying/softwares/酶R2/enzyme_交接20260609/new_data_test/110KRD_96SM_std.xlsx"
+from openpyxl.styles import PatternFill
 
 
 # ============================================================
-# 清洗编号
+# 文件路径
 # ============================================================
-def clean_id(x):
-    if pd.isna(x):
-        return ""
-    if isinstance(x, float) and x.is_integer():
-        return str(int(x))
-    s = str(x).strip()
-    return s[:-2] if s.endswith(".0") else s
+input_xlsx = "/data/caoying/softwares/酶R2/enzyme_交接20260609/new_data_test/110KRD_96SM_std.xlsx"
 
-
-def clean_sm(x):
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
+output_xlsx = "/data/caoying/softwares/酶R2/enzyme_交接20260609/new_data_test/110KRD_96SM_std_format.xlsx"
 
 
 # ============================================================
-# 1. 读取预测结果
+# 颜色设置
 # ============================================================
-pred_df = pd.read_csv(pred_csv)
 
-pred_df["SM_match"] = pred_df["SM"].apply(clean_sm)
-pred_df["Name_match"] = pred_df["Name"].apply(clean_id)
+# 排名1：深绿色
+dark_green = (0, 97, 0)
 
-
-# ============================================================
-# 2. SM → Sheet名称
-# ============================================================
-smile_df = pd.read_csv(smile_csv)
-
-smile_df["SM_match"] = smile_df["SM"].apply(clean_sm)
-smile_df["Sheet_Name"] = smile_df["Name"].astype(str).str.strip()
-
-sm_to_sheet = dict(zip(smile_df["SM_match"], smile_df["Sheet_Name"]))
-
-pred_df["Sheet_Name"] = pred_df["SM_match"].map(sm_to_sheet)
+# 排名30：浅绿色
+light_green = (226, 240, 217)
 
 
 # ============================================================
-# 3. 每个底物内部计算排名
+# 绿色渐变计算
 # ============================================================
-pred_df["rank"] = (
-    pred_df.groupby("SM_match")["pred_Conv"]
-    .rank(method="min", ascending=False)
-    .astype("Int64")
-)
+def get_green_color(rank):
 
+    ratio = (rank - 1) / 29
 
-# ============================================================
-# 4. 打开 Excel 模板
-# ============================================================
-wb = load_workbook(template_xlsx)
+    r = int(dark_green[0] + (light_green[0] - dark_green[0]) * ratio)
+    g = int(dark_green[1] + (light_green[1] - dark_green[1]) * ratio)
+    b = int(dark_green[2] + (light_green[2] - dark_green[2]) * ratio)
 
-total_match = 0
-total_unmatch = 0
-sheet_match = 0
-sheet_not_found = 0
+    return "{:02X}{:02X}{:02X}".format(r, g, b)
 
 
 # ============================================================
-# 5. 按底物 Sheet 处理
+# 读取Excel
 # ============================================================
-for sheet_name, group in pred_df.groupby("Sheet_Name", dropna=True):
+wb = load_workbook(input_xlsx)
 
-    sheet_name = str(sheet_name).strip()
+total_sheets = 0
+success_sheets = 0
+total_colored = 0
 
-    if sheet_name not in wb.sheetnames:
-        print("[Sheet不存在]", sheet_name)
-        sheet_not_found += 1
-        total_unmatch += len(group)
-        continue
 
-    ws = wb[sheet_name]
-    sheet_match += 1
+# ============================================================
+# 遍历所有Sheet
+# ============================================================
+for ws in wb.worksheets:
 
-    print("\n======================================")
-    print("Sheet:", sheet_name)
-    print("预测数据:", len(group))
+    total_sheets += 1
+
+    print("\n===================================")
+    print("Sheet:", ws.title)
 
     # --------------------------------------------------------
-    # 6. 找到模板表头
+    # 1. 查找表头
     # --------------------------------------------------------
     header_row = None
-    header = {}
 
     for r in range(1, min(ws.max_row, 30) + 1):
 
-        row_values = [
+        values = [
             str(ws.cell(r, c).value).strip()
             if ws.cell(r, c).value is not None else ""
             for c in range(1, ws.max_column + 1)
         ]
 
-        if "Biortus No." in row_values:
+        if "Biortus No." in values:
             header_row = r
-            for c, value in enumerate(row_values, start=1):
-                if value:
-                    header[value] = c
             break
 
     if header_row is None:
-        print("[错误] 没找到 Biortus No.")
-        total_unmatch += len(group)
+        print("[跳过] 没有找到表头")
         continue
 
+
     # --------------------------------------------------------
-    # 7. 找到原有两列
+    # 2. 找到所有R2预测列
     # --------------------------------------------------------
-    if "R2 Predicted Value" not in header or "R2 Predicted Rank" not in header:
-        print("[错误] 没找到原有 R2 预测列")
-        total_unmatch += len(group)
+    pred_cols = []
+    rank_cols = []
+
+    for c in range(1, ws.max_column + 1):
+
+        value = ws.cell(header_row, c).value
+
+        if value is None:
+            continue
+
+        value = str(value).strip()
+
+        if value == "R2 Predicted Value":
+            pred_cols.append(c)
+
+        elif value == "R2 Predicted Rank":
+            rank_cols.append(c)
+
+
+    if not pred_cols or not rank_cols:
+        print("[跳过] 没有找到R2预测列")
         continue
 
-    old_pred_col = header["R2 Predicted Value"]
-    old_rank_col = header["R2 Predicted Rank"]
 
-    if old_rank_col != old_pred_col + 1:
-        print("[错误] 原有两列不相邻")
-        total_unmatch += len(group)
-        continue
+    # 默认取最后一组新增列
+    pred_col = pred_cols[-1]
+    rank_col = rank_cols[-1]
 
-    # --------------------------------------------------------
-    # 8. 在原有两列后新增两列
-    # --------------------------------------------------------
-    new_pred_col = old_rank_col + 1
-    new_rank_col = old_rank_col + 2
+    print("预测值列:", pred_col)
+    print("排名列:", rank_col)
 
-    ws.insert_cols(new_pred_col, 2)
-
-    ws.cell(header_row, new_pred_col).value = "R2 Predicted Value"
-    ws.cell(header_row, new_rank_col).value = "R2 Predicted Rank"
 
     # --------------------------------------------------------
-    # 9. 建立模板 Biortus No. → Excel 行号
+    # 3. 设置表头格式
+    #    复制其他正常表头的格式
     # --------------------------------------------------------
-    excel_id_to_row = {}
+
+    # 以Biortus No.表头作为格式模板
+    template_col = None
+
+    for c in range(1, ws.max_column + 1):
+
+        if ws.cell(header_row, c).value == "Biortus No.":
+            template_col = c
+            break
+
+    if template_col is not None:
+
+        template_cell = ws.cell(header_row, template_col)
+
+        for target_col in [pred_col, rank_col]:
+
+            target_cell = ws.cell(header_row, target_col)
+
+            target_cell.font = copy(template_cell.font)
+            target_cell.fill = copy(template_cell.fill)
+            target_cell.border = copy(template_cell.border)
+            target_cell.alignment = copy(template_cell.alignment)
+            target_cell.protection = copy(template_cell.protection)
+            target_cell.number_format = template_cell.number_format
+
+    # --------------------------------------------------------
+    # 4. 排名列设置绿色渐变
+    #    Rank 1最深，Rank 30最浅
+    # --------------------------------------------------------
+
+    colored_count = 0
 
     for r in range(header_row + 1, ws.max_row + 1):
 
-        biortus_id = clean_id(ws.cell(r, header["Biortus No."]).value)
+        cell = ws.cell(r, rank_col)
 
-        if biortus_id:
-            excel_id_to_row[biortus_id] = r
-
-    # --------------------------------------------------------
-    # 10. 预测 CSV Name → 模板 Biortus No. 匹配
-    # --------------------------------------------------------
-    match_count = 0
-
-    for _, pred_row in group.iterrows():
-
-        # 预测结果 Name 对应模板 Biortus No.
-        biortus_id = pred_row["Name_match"]
-
-        if not biortus_id:
+        if cell.value is None:
             continue
 
-        if biortus_id not in excel_id_to_row:
-            total_unmatch += 1
+        try:
+            rank = int(float(cell.value))
+        except (ValueError, TypeError):
             continue
 
-        excel_row = excel_id_to_row[biortus_id]
+        # 只处理排名前30，包括30
+        if 1 <= rank <= 30:
 
-        # 新增预测值
-        ws.cell(excel_row, new_pred_col).value = round(
-            float(pred_row["pred_Conv"]), 3
-        )
+            color = get_green_color(rank)
 
-        # 新增排名
-        ws.cell(excel_row, new_rank_col).value = int(pred_row["rank"])
+            cell.fill = PatternFill(
+                fill_type="solid",
+                fgColor=color
+            )
 
-        match_count += 1
-        total_match += 1
+            colored_count += 1
 
-    print("成功匹配:", match_count)
+    total_colored += colored_count
+    success_sheets += 1
+
+    print("设置绿色排名数量:", colored_count)
 
 
 # ============================================================
-# 11. 保存
+# 5. 保存
 # ============================================================
 wb.save(output_xlsx)
 
-print("\n========== 处理完成 ==========")
-print("Sheet匹配数量:", sheet_match)
-print("不存在的Sheet:", sheet_not_found)
-print("成功填入:", total_match)
-print("未匹配:", total_unmatch)
+print("\n===================================")
+print("Excel格式处理完成")
+print("===================================")
+
+print("Sheet总数:", total_sheets)
+print("成功处理Sheet:", success_sheets)
+print("设置绿色排名总数:", total_colored)
 print("输出文件:", output_xlsx)
