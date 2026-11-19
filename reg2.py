@@ -13,20 +13,17 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 SEED, BATCH_SIZE, NUM_WORKERS = 123, 256, 4
 
 PRETRAINED_MODEL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/enzyme_train/model/reg/model_resnet_krd_conc_S2_KRD_M_55%_add/best_model_add.pth"
-CSV_PATH = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/13k_std.csv"
+CSV_PATH = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/13k_std_非0.csv"
 ESM_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/esm_144KRD.pkl"
 MOL_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/SM96_std.pkl"
-SPLIT_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/split_Activity_enz"
-MODEL_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/model_Activity_reg_enz_zero_nonzero"
+SPLIT_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/split_Activity_enz_非0"
+MODEL_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/model_Activity_reg_enz_非0_v2"
 
 SM_COL, ENZ_COL, Y_COL = "SM loading (g/L)", "Enzyme loading (g/L)", "Activity"
 
-# 浓度列为原始g/L时用raw_gL；只有当CSV已有的_norm与预训练模型完全同源时才用existing_norm
-CONC_MODE = "raw_gL"  # "raw_gL" 或 "existing_norm"
-
-# 零值/非零值权重：非零样本适度提高权重，避免零值占多数时模型过度贴近0
-# 先用1.5，不建议一开始就设很高；后续可对比1.0、1.5、2.0
-ZERO_WEIGHT, NONZERO_WEIGHT = 1.0, 1.5
+# 优先使用CSV中已有的归一化特征；必须确认它们与预训练模型训练时的定义和scaler一致
+# 若CSV没有这两列，或它们不是预训练模型使用的特征，改成 "raw_gL"
+CONC_MODE = "existing_norm"  # "existing_norm" 或 "raw_gL"
 
 STAGE1_EPOCHS, STAGE2_EPOCHS = 50, 500
 STAGE1_PATIENCE, STAGE2_PATIENCE = 15, 50
@@ -73,27 +70,13 @@ def safe_corr(func, y, p):
 
 
 def regression_metrics(y, p):
-    y, p = np.asarray(y), np.asarray(p)
-    if len(y) == 0:
-        return {"N": 0, "RMSE": np.nan, "MAE": np.nan, "R2": np.nan,
-                "Pearson": np.nan, "Spearman": np.nan}
     return {
-        "N": int(len(y)),
         "RMSE": float(np.sqrt(mean_squared_error(y, p))),
         "MAE": float(mean_absolute_error(y, p)),
-        "R2": float(r2_score(y, p)) if len(y) > 1 else np.nan,
+        "R2": float(r2_score(y, p)),
         "Pearson": safe_corr(pearsonr, y, p),
         "Spearman": safe_corr(spearmanr, y, p)
     }
-
-
-def print_metrics(title, metrics):
-    print(title)
-    for k, v in metrics.items():
-        if isinstance(v, (float, np.floating)):
-            print(f"  {k}: {v:.6f}")
-        else:
-            print(f"  {k}: {v}")
 
 
 # ==================== 3. Dataset ====================
@@ -101,12 +84,8 @@ class EnzymeDataset(Dataset):
     def __init__(self, df, esm, mol, y_mean, y_std):
         self.df = df.reset_index(drop=True)
         self.esm, self.mol = esm, mol
-        y_raw = self.df[Y_COL].to_numpy(dtype=np.float64)
-        y_log = np.log1p(y_raw)
-        self.y = ((y_log - y_mean) / y_std).astype(np.float32)
-        self.weight = np.where(
-            y_raw > 0, NONZERO_WEIGHT, ZERO_WEIGHT
-        ).astype(np.float32)
+        y = np.log1p(self.df[Y_COL].to_numpy(dtype=np.float64))
+        self.y = ((y - y_mean) / y_std).astype(np.float32)
 
     def __len__(self):
         return len(self.df)
@@ -130,7 +109,6 @@ class EnzymeDataset(Dataset):
             torch.tensor([r["SM_norm"]], dtype=torch.float32),
             torch.tensor([r["Enz_norm"]], dtype=torch.float32),
             torch.tensor(self.y[i], dtype=torch.float32),
-            torch.tensor(self.weight[i], dtype=torch.float32),
             str(r["idx"]), str(r["Name"]), str(r["SM"])
         )
 
@@ -155,12 +133,11 @@ def collate_fn(batch):
         torch.stack([x[3] for x in batch]),
         torch.stack([x[4] for x in batch]),
         torch.stack([x[5] for x in batch]),
-        torch.stack([x[6] for x in batch]),
-        [x[7] for x in batch], [x[8] for x in batch], [x[9] for x in batch]
+        [x[6] for x in batch], [x[7] for x in batch], [x[8] for x in batch]
     )
 
 
-# ==================== 4. 模型：沿用预训练结构 ====================
+# ==================== 4. 模型：保留原预训练架构 ====================
 class EnzymeSubstrateRegressor(nn.Module):
     def __init__(self, esm_dim=1280, mol_dim=768, dropout=0.1, hidden_dim=256):
         super().__init__()
@@ -229,10 +206,11 @@ def load_pretrained(model, path, device):
     return model
 
 
-# ==================== 6. 训练、预测 ====================
+# ==================== 6. 训练与预测 ====================
 def run_epoch(model, loader, optimizer, loss_fn, device, training, stage1=False):
     if training:
         if stage1:
+            # 冻结骨干网络的Dropout/BatchNorm状态，只训练最终回归层
             model.eval()
             model.fc4.train()
         else:
@@ -244,12 +222,11 @@ def run_epoch(model, loader, optimizer, loss_fn, device, training, stage1=False)
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         for b in loader:
-            e, mask, mol, sm, enz, y, weight = [
-                v.to(device, non_blocking=True) for v in b[:7]
+            e, mask, mol, sm, enz, y = [
+                v.to(device, non_blocking=True) for v in b[:6]
             ]
             pred = model(e, mask, mol, sm, enz)
-            per_sample = loss_fn(pred, y)
-            loss = (per_sample * weight).sum() / weight.sum().clamp_min(1e-8)
+            loss = loss_fn(pred, y)
 
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -276,35 +253,17 @@ def predict(model, loader, device, y_mean, y_std):
         p = model(e, mask, mol, sm, enz).cpu().numpy()
         ys.extend(y.cpu().numpy())
         ps.extend(p)
-        meta.extend(zip(*b[7:10]))
+        meta.extend(zip(*b[6:9]))
 
     y_true = np.expm1(np.asarray(ys) * y_std + y_mean)
     y_pred = np.expm1(np.asarray(ps) * y_std + y_mean)
+    # Activity定义为非负值；逆变换后的负预测截断为0
     y_pred = np.maximum(y_pred, 0.0)
 
     result = pd.DataFrame(meta, columns=["idx", "Name", "SM"])
     result["True_Activity"] = y_true
     result["Pred_Activity"] = y_pred
-    return result
-
-
-def evaluate_and_print(title, result):
-    y = result["True_Activity"].to_numpy()
-    p = result["Pred_Activity"].to_numpy()
-    is_zero = (y == 0)
-    is_nonzero = (y > 0)
-
-    print_metrics(title + " ALL", regression_metrics(y, p))
-    if is_zero.any():
-        print_metrics(title + " ZERO subset", regression_metrics(y[is_zero], p[is_zero]))
-        print(f"  ZERO预测均值: {p[is_zero].mean():.6f}")
-    if is_nonzero.any():
-        print_metrics(title + " NONZERO subset", regression_metrics(y[is_nonzero], p[is_nonzero]))
-        print(f"  NONZERO真实均值: {y[is_nonzero].mean():.6f} | 预测均值: {p[is_nonzero].mean():.6f}")
-
-    # log空间指标用于观察长尾压缩后的拟合情况，不作为主要选模指标
-    log_rmse = np.sqrt(mean_squared_error(np.log1p(y), np.log1p(p)))
-    print(f"{title} log1p-RMSE: {log_rmse:.6f}")
+    return regression_metrics(y_true, y_pred), result
 
 
 def save_model(model, path):
@@ -326,6 +285,7 @@ def train_stage(
         [p for p in model.parameters() if p.requires_grad],
         lr=lr, weight_decay=WEIGHT_DECAY
     )
+    # 以原始Activity验证RMSE作为调度和选模指标
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=8,
         threshold=MIN_DELTA, min_lr=1e-7
@@ -339,11 +299,7 @@ def train_stage(
         val_loss = run_epoch(
             model, val_loader, None, loss_fn, device, False, False
         )
-        val_result = predict(model, val_loader, device, y_mean, y_std)
-        val_metrics = regression_metrics(
-            val_result.True_Activity.to_numpy(),
-            val_result.Pred_Activity.to_numpy()
-        )
+        val_metrics, _ = predict(model, val_loader, device, y_mean, y_std)
         rmse = val_metrics["RMSE"]
         scheduler.step(rmse)
 
@@ -351,8 +307,8 @@ def train_stage(
         print(
             f"Epoch {epoch:03d}/{epochs} | LR={current_lr:.2e} | "
             f"TrainLoss={tr_loss:.6f} | ValLoss={val_loss:.6f} | "
-            f"ValRMSE={rmse:.6f} | ValMAE={val_metrics['MAE']:.6f} | "
-            f"ValR2={val_metrics['R2']:.4f}"
+            f"ValRMSE={rmse:.6f} | MAE={val_metrics['MAE']:.6f} | "
+            f"R2={val_metrics['R2']:.4f}"
         )
 
         if rmse < best - MIN_DELTA:
@@ -375,8 +331,7 @@ def train_stage(
 def main():
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device, "| Task: Zero + Nonzero Pure Activity Regression")
-    print(f"Loss weights: zero={ZERO_WEIGHT}, nonzero={NONZERO_WEIGHT}")
+    print("Device:", device, "| Task: Pure non-zero Activity Regression")
 
     esm, mol = load_pickle(ESM_PKL), load_pickle(MOL_PKL)
     print("ESM features:", len(esm), "| MolFormer features:", len(mol))
@@ -395,7 +350,9 @@ def main():
     if df["idx"].duplicated().any():
         raise ValueError("idx存在重复")
     if (df[Y_COL] < 0).any():
-        raise ValueError("检测到负Activity；当前脚本假设Activity非负，请先核对标签")
+        raise ValueError("检测到负Activity；请先核对标签，不要直接训练")
+    if (df[Y_COL] == 0).any():
+        print("提示：CSV中仍有Activity=0的样本，本脚本不做零值加权。")
 
     ids = {n: set(read_ids(n)) for n in ["train.txt", "val.txt", "test.txt"]}
     if (
@@ -416,6 +373,7 @@ def main():
     if any(x.empty for x in parts.values()):
         raise ValueError("Train/Val/Test存在空数据集")
 
+    # 严格检查酶隔离，避免同一酶跨集合造成泄漏
     groups = {k: set(v.Name) for k, v in parts.items()}
     if (
         groups["train"] & groups["val"]
@@ -430,26 +388,38 @@ def main():
         if set(d.SM) - set(mol):
             raise KeyError(f"{k}缺少MolFormer特征")
 
+    # 浓度特征：避免不知情地对已经标准化的列再次log和标准化
     if CONC_MODE == "existing_norm":
+        norm_cols = ["SM_norm", "Enz_norm"]
+        miss_norm = [c for c in norm_cols if c not in df.columns]
+        if miss_norm:
+            raise KeyError(
+                f"CONC_MODE='existing_norm'，但CSV缺少{miss_norm}。"
+                "若CSV中的g/L是原始浓度，请将CONC_MODE改为'raw_gL'。"
+            )
         for d in parts.values():
-            for c in ["SM_norm", "Enz_norm"]:
-                if c not in d.columns:
-                    raise KeyError(f"CSV缺少{c}，不能使用existing_norm")
+            for c in norm_cols:
                 d[c] = pd.to_numeric(d[c], errors="coerce")
                 if d[c].isna().any():
-                    raise ValueError(f"{c}存在空值")
-        conc_scaler = {"mode": "existing_norm"}
+                    raise ValueError(f"{c}存在空值或非数值")
+        conc_scaler = {"mode": "existing_norm", "note": "直接使用CSV中的SM_norm和Enz_norm"}
+
     elif CONC_MODE == "raw_gL":
         for d in parts.values():
             for c in [SM_COL, ENZ_COL]:
                 d[c] = pd.to_numeric(d[c], errors="coerce")
-                if d[c].isna().any() or (d[c] < 0).any():
-                    raise ValueError(f"{c}有空值或负值，请检查原始g/L浓度")
+                if d[c].isna().any():
+                    raise ValueError(f"{c}存在空值或非数值")
+                if (d[c] < 0).any():
+                    raise ValueError(f"{c}存在负浓度，请检查单位和数据")
+        for d in parts.values():
             d["SM_log"] = np.log1p(d[SM_COL])
             d["Enz_log"] = np.log1p(d[ENZ_COL])
 
-        sm_mean, sm_std = float(parts["train"].SM_log.mean()), float(parts["train"].SM_log.std())
-        enz_mean, enz_std = float(parts["train"].Enz_log.mean()), float(parts["train"].Enz_log.std())
+        sm_mean = float(parts["train"].SM_log.mean())
+        sm_std = float(parts["train"].SM_log.std())
+        enz_mean = float(parts["train"].Enz_log.mean())
+        enz_std = float(parts["train"].Enz_log.std())
         sm_std = sm_std if np.isfinite(sm_std) and sm_std > 1e-12 else 1.0
         enz_std = enz_std if np.isfinite(enz_std) and enz_std > 1e-12 else 1.0
 
@@ -463,19 +433,19 @@ def main():
             "enz_mean": enz_mean, "enz_std": enz_std
         }
     else:
-        raise ValueError("CONC_MODE只能是existing_norm或raw_gL")
+        raise ValueError("CONC_MODE只能是'existing_norm'或'raw_gL'")
 
-    y_train = parts["train"][Y_COL].to_numpy(dtype=np.float64)
-    y_log = np.log1p(y_train)
+    # Activity使用log1p+训练集z-score；不对Activity做人为加权
+    y_log = np.log1p(parts["train"][Y_COL].to_numpy(dtype=np.float64))
     y_mean, y_std = float(y_log.mean()), float(y_log.std(ddof=1))
     if not np.isfinite(y_std) or y_std < 1e-12:
         y_std = 1.0
 
     scaler = {
-        "activity_mean": y_mean, "activity_std": y_std,
+        "activity_mean": y_mean,
+        "activity_std": y_std,
         "activity_transform": "log1p+train_zscore",
-        "concentration": conc_scaler,
-        "zero_weight": ZERO_WEIGHT, "nonzero_weight": NONZERO_WEIGHT
+        "concentration": conc_scaler
     }
     with open(os.path.join(MODEL_DIR, "scaler.json"), "w", encoding="utf-8") as f:
         json.dump(scaler, f, ensure_ascii=False, indent=2)
@@ -483,14 +453,12 @@ def main():
     print("Samples:", {k: len(v) for k, v in parts.items()})
     print("Enzymes:", {k: len(v) for k, v in groups.items()})
     for k, d in parts.items():
-        y = d[Y_COL].to_numpy()
         print(
-            f"{k}: zero={(y == 0).sum()} ({(y == 0).mean():.2%}), "
-            f"nonzero={(y > 0).sum()} ({(y > 0).mean():.2%}), "
-            f"mean={y.mean():.4f}, median={np.median(y):.4f}, "
-            f"p90={np.quantile(y, 0.90):.4f}, p99={np.quantile(y, 0.99):.4f}, "
-            f"max={y.max():.4f}"
+            f"{k}: zero={(d[Y_COL] == 0).sum()}, "
+            f"mean={d[Y_COL].mean():.4f}, std={d[Y_COL].std():.4f}, "
+            f"median={d[Y_COL].median():.4f}, max={d[Y_COL].max():.4f}"
         )
+    print("Concentration mode:", CONC_MODE)
 
     datasets = {
         k: EnzymeDataset(v, esm, mol, y_mean, y_std)
@@ -501,6 +469,7 @@ def main():
         pin_memory=(device.type == "cuda"), collate_fn=collate_fn
     )
     loaders = {
+        # drop_last避免BatchNorm遇到只有1条样本的训练batch
         "train": DataLoader(datasets["train"], shuffle=True, drop_last=True, **common),
         "val": DataLoader(datasets["val"], shuffle=False, drop_last=False, **common),
         "test": DataLoader(datasets["test"], shuffle=False, drop_last=False, **common)
@@ -509,8 +478,7 @@ def main():
     model = load_pretrained(
         EnzymeSubstrateRegressor().to(device), PRETRAINED_MODEL, device
     )
-    # 逐样本SmoothL1，零值与非零值使用温和权重
-    loss_fn = nn.SmoothL1Loss(beta=1.0, reduction="none")
+    loss_fn = nn.SmoothL1Loss(beta=1.0)
 
     print("\n========== STAGE 1: TRAIN FC4 ONLY ==========")
     stage1_path = os.path.join(MODEL_DIR, "stage1_best.pth")
@@ -530,16 +498,20 @@ def main():
         stage1=False
     )
 
-    print("\n========== TEST: ZERO + NONZERO REGRESSION ==========")
-    test_result = predict(model, loaders["test"], device, y_mean, y_std)
-    evaluate_and_print("TEST", test_result)
+    print("\n========== TEST: PURE ACTIVITY REGRESSION ==========")
+    test_metrics, test_result = predict(
+        model, loaders["test"], device, y_mean, y_std
+    )
+    for k, v in test_metrics.items():
+        print(f"{k}: {v:.6f}")
     test_result.to_csv(
         os.path.join(MODEL_DIR, "test_predictions.csv"),
         index=False, encoding="utf-8-sig"
     )
 
-    val_result = predict(model, loaders["val"], device, y_mean, y_std)
-    evaluate_and_print("VAL", val_result)
+    val_metrics, val_result = predict(
+        model, loaders["val"], device, y_mean, y_std
+    )
     val_result.to_csv(
         os.path.join(MODEL_DIR, "val_predictions.csv"),
         index=False, encoding="utf-8-sig"
