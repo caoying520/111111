@@ -1,5 +1,3 @@
-
-# -*- coding: utf-8 -*-
 import os, json, random, pickle
 import numpy as np
 import pandas as pd
@@ -13,17 +11,15 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 # ==================== 1. 参数 ====================
 SEED, BATCH_SIZE, NUM_WORKERS = 123, 256, 4
 PRETRAINED_MODEL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/enzyme_train/model/reg/model_resnet_krd_conc_S2_KRD_M_55%_add/best_model_add.pth"
-CSV_PATH = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/13k_std.csv"
+CSV_PATH = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/13k_std_非0.csv"
 ESM_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/esm_144KRD.pkl"
 MOL_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/SM96_std.pkl"
-SPLIT_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/split_Activity_enz"
-MODEL_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/model_Activity_reg_enz"
+SPLIT_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/split_Activity_enz_非0"
+MODEL_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/model_Activity_reg_enz_非0"
 SM_COL, ENZ_COL, Y_COL = "SM loading (g/L)", "Enzyme loading (g/L)", "Activity"
 STAGE1_EPOCHS, STAGE2_EPOCHS = 50, 500
 STAGE1_PATIENCE, STAGE2_PATIENCE = 15, 50
 STAGE1_LR, STAGE2_LR, WEIGHT_DECAY = 1e-3, 3e-5, 1e-5
-# 零膨胀数据（68.8% 精确为 0）下，非零样本的损失权重；0 样本权重固定为 1.0
-NONZERO_WEIGHT = 3.0
 MIN_DELTA, GRAD_CLIP = 1e-5, 5.0
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -54,10 +50,6 @@ class EnzymeDataset(Dataset):
         self.df, self.esm, self.mol = df.reset_index(drop=True), esm, mol
         y = np.log1p(self.df[Y_COL].to_numpy(dtype=float))
         self.y = ((y - y_mean) / y_std).astype(np.float32)
-        # 零膨胀加权：非零活性样本权重 NONZERO_WEIGHT，零样本权重 1.0
-        self.w = np.where(
-            self.df[Y_COL].to_numpy(dtype=float) > 0, NONZERO_WEIGHT, 1.0
-        ).astype(np.float32)
 
     def __len__(self): return len(self.df)
 
@@ -70,7 +62,7 @@ class EnzymeDataset(Dataset):
         if n == 0: raise ValueError(f"{r['Name']} 的 ESM 序列长度为0")
         mol = torch.as_tensor(np.asarray(self.mol[str(r["SM"])]), dtype=torch.float32).reshape(-1)
         if emb.shape[1] != 1280 or mol.numel() != 768: raise ValueError("ESM/MolFormer 特征维度错误")
-        return emb, mask, mol, torch.tensor([r["SM_norm"]], dtype=torch.float32), torch.tensor([r["Enz_norm"]], dtype=torch.float32), torch.tensor(self.y[i]), str(r["idx"]), str(r["Name"]), str(r["SM"]), torch.tensor(self.w[i], dtype=torch.float32)
+        return emb, mask, mol, torch.tensor([r["SM_norm"]], dtype=torch.float32), torch.tensor([r["Enz_norm"]], dtype=torch.float32), torch.tensor(self.y[i]), str(r["idx"]), str(r["Name"]), str(r["SM"])
 
 
 def collate_fn(batch):
@@ -81,7 +73,7 @@ def collate_fn(batch):
         pad = max_len - n
         if pad: e = torch.cat([e, torch.zeros(pad, e.shape[1])]); m = torch.cat([m, torch.zeros(pad, dtype=torch.bool)])
         embs.append(e); masks.append(m)
-    return torch.stack(embs), torch.stack(masks), torch.stack([x[2] for x in batch]), torch.stack([x[3] for x in batch]), torch.stack([x[4] for x in batch]), torch.stack([x[5] for x in batch]), [x[6] for x in batch], [x[7] for x in batch], [x[8] for x in batch], torch.stack([x[9] for x in batch])
+    return torch.stack(embs), torch.stack(masks), torch.stack([x[2] for x in batch]), torch.stack([x[3] for x in batch]), torch.stack([x[4] for x in batch]), torch.stack([x[5] for x in batch]), [x[6] for x in batch], [x[7] for x in batch], [x[8] for x in batch]
 
 
 # ==================== 4. 模型 ====================
@@ -142,21 +134,17 @@ def regression_metrics(y, p):
 
 # ==================== 7. 训练与预测 ====================
 def train_epoch(model, loader, optimizer, loss_fn, device, training=True):
-    model.train(training); total, count = 0.0, 0.0
+    model.train(training); total, count = 0.0, 0
     for b in loader:
         e, mask, mol, sm, enz, y = [v.to(device, non_blocking=True) for v in b[:6]]
-        w = b[9].to(device, non_blocking=True)
         if training and len(y) == 1: model.eval()
-        pred = model(e, mask, mol, sm, enz)
-        loss_vec = loss_fn(pred, y)
-        w = w.to(loss_vec.dtype)
-        loss = (loss_vec * w).sum() / w.sum().clamp_min(1e-8)
+        pred = model(e, mask, mol, sm, enz); loss = loss_fn(pred, y)
         if training:
             optimizer.zero_grad(set_to_none=True); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP); optimizer.step()
             if len(y) == 1: model.train()
-        total += (loss_vec * w).sum().item(); count += w.sum().item()
-    return total / max(count, 1e-8)
+        total += loss.item() * len(y); count += len(y)
+    return total / max(count, 1)
 
 
 @torch.no_grad()
@@ -241,7 +229,7 @@ def main():
     kw = dict(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=device.type == "cuda", collate_fn=collate_fn)
     loaders = {"train": DataLoader(datasets["train"], shuffle=True, drop_last=False, **kw), "val": DataLoader(datasets["val"], shuffle=False, **kw), "test": DataLoader(datasets["test"], shuffle=False, **kw)}
     model = load_pretrained(EnzymeSubstrateRegressor().to(device), PRETRAINED_MODEL, device)
-    loss_fn = nn.SmoothL1Loss(beta=1.0, reduction="none")
+    loss_fn = nn.SmoothL1Loss(beta=1.0)
     print("\n========== STAGE 1: TRAIN FC4 ==========")
     stage1_path = os.path.join(MODEL_DIR, "stage1_best.pth")
     train_stage(model, loaders["train"], loaders["val"], device, loss_fn, STAGE1_EPOCHS, STAGE1_PATIENCE, STAGE1_LR, list(model.fc4.parameters()), y_mean, y_std, stage1_path)
