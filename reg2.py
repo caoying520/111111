@@ -17,12 +17,16 @@ CSV_PATH = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/1
 ESM_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/esm_144KRD.pkl"
 MOL_PKL = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/SM96_std.pkl"
 SPLIT_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/split_Activity_enz_clean"
-MODEL_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/model_Activity_reg_enz/split2"
+MODEL_DIR = "/data/caoying/softwares/酶R2/enzyme_交接20260609/微调/KRD/13K/model_Activity_reg_enz/split2/split_去重复酶权重"
 Y_COL = "Activity"
 STAGE1_EPOCHS, STAGE2_EPOCHS = 50, 500
 STAGE1_PATIENCE, STAGE2_PATIENCE = 15, 50
 STAGE1_LR, STAGE2_LR, WEIGHT_DECAY = 1e-3, 3e-5, 1e-5
 MIN_DELTA, GRAD_CLIP = 1e-5, 5.0
+# 重叠酶降权：序列命中预训练集的酶在训练时降权，避免其偏低活性的分布主导 loss
+PRETRAINED_CSV = "/data/caoying/softwares/酶R2/enzyme_交接20260609/enzyme_train/data/酶筛/merged_KRD_S2_KRD_M_add.csv"
+USE_SAMPLE_WEIGHT = True
+OVERLAP_WEIGHT = 0.3
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 
@@ -52,6 +56,8 @@ class EnzymeDataset(Dataset):
         self.df, self.esm, self.mol = df.reset_index(drop=True), esm, mol
         y = np.log1p(self.df[Y_COL].to_numpy(dtype=float))
         self.y = ((y - y_mean) / y_std).astype(np.float32)
+        # 样本权重：重叠酶行 < 1，干净行 = 1（无 sample_w 列时全为 1）
+        self.w = self.df["sample_w"].to_numpy(dtype=np.float32) if "sample_w" in self.df.columns else np.ones(len(self.df), dtype=np.float32)
 
     def __len__(self): return len(self.df)
 
@@ -64,7 +70,7 @@ class EnzymeDataset(Dataset):
         if n == 0: raise ValueError(f"{r['Name']} 的 ESM 序列长度为0")
         mol = torch.as_tensor(np.asarray(self.mol[str(r["SM"])]), dtype=torch.float32).reshape(-1)
         if emb.shape[1] != 1280 or mol.numel() != 768: raise ValueError("ESM/MolFormer 特征维度错误")
-        return emb, mask, mol, torch.tensor(self.y[i]), str(r["idx"]), str(r["Name"]), str(r["SM"])
+        return emb, mask, mol, torch.tensor(self.y[i]), str(r["idx"]), str(r["Name"]), str(r["SM"]), torch.tensor(self.w[i], dtype=torch.float32)
 
 
 def collate_fn(batch):
@@ -75,7 +81,7 @@ def collate_fn(batch):
         pad = max_len - n
         if pad: e = torch.cat([e, torch.zeros(pad, e.shape[1])]); m = torch.cat([m, torch.zeros(pad, dtype=torch.bool)])
         embs.append(e); masks.append(m)
-    return torch.stack(embs), torch.stack(masks), torch.stack([x[2] for x in batch]), torch.stack([x[3] for x in batch]), [x[4] for x in batch], [x[5] for x in batch], [x[6] for x in batch]
+    return torch.stack(embs), torch.stack(masks), torch.stack([x[2] for x in batch]), torch.stack([x[3] for x in batch]), [x[4] for x in batch], [x[5] for x in batch], [x[6] for x in batch], torch.stack([x[7] for x in batch])
 
 
 # ==================== 4. 模型 ====================
@@ -145,8 +151,11 @@ def train_epoch(model, loader, optimizer, loss_fn, device, training=True):
     model.train(training); total, count = 0.0, 0
     for b in loader:
         e, mask, mol, y = [v.to(device, non_blocking=True) for v in b[:4]]
+        w = b[7].to(device, non_blocking=True) if len(b) > 7 else None
         if training and len(y) == 1: model.eval()
-        pred = model(e, mask, mol); loss = loss_fn(pred, y)
+        pred = model(e, mask, mol)
+        loss_vec = loss_fn(pred, y)                                   # loss_fn 用 reduction="none"
+        loss = (loss_vec * w).sum() / w.sum().clamp_min(1e-8) if w is not None else loss_vec.mean()
         if training:
             optimizer.zero_grad(set_to_none=True); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP); optimizer.step()
@@ -224,11 +233,24 @@ def main():
         json.dump({"activity_mean": y_mean, "activity_std": y_std, "transform": "log1p+zscore"}, f, ensure_ascii=False, indent=2)
     print("Samples:", {k: len(v) for k, v in parts.items()}, "| Enzymes:", {k: len(v) for k, v in groups.items()})
     for k, d in parts.items(): print(f"{k}: zero={(d[Y_COL] == 0).sum()}, mean={d[Y_COL].mean():.4f}, std={d[Y_COL].std():.4f}, max={d[Y_COL].max():.4f}")
+    # ---------- 重叠酶降权：序列命中预训练集的样本权重设为 OVERLAP_WEIGHT ----------
+    pre_seqs = set()
+    if USE_SAMPLE_WEIGHT:
+        if not os.path.isfile(PRETRAINED_CSV): raise FileNotFoundError(PRETRAINED_CSV)
+        if "sequence" not in df.columns: raise KeyError("CSV 缺少 sequence 列，无法判定重叠")
+        pre_seqs = set(pd.read_csv(PRETRAINED_CSV, low_memory=False)["sequence"].astype(str).str.strip())
+    for k, d in parts.items():
+        if pre_seqs:
+            ov = d["sequence"].astype(str).str.strip().isin(pre_seqs)
+            d["sample_w"] = np.where(ov, OVERLAP_WEIGHT, 1.0).astype(np.float32)
+            print(f"{k}: 重叠酶行 {int(ov.sum())}/{len(d)} ({ov.mean()*100:.1f}%)，重叠酶权重={OVERLAP_WEIGHT}")
+        else:
+            d["sample_w"] = np.ones(len(d), dtype=np.float32)
     datasets = {k: EnzymeDataset(v, esm, mol, y_mean, y_std) for k, v in parts.items()}
     kw = dict(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=device.type == "cuda", collate_fn=collate_fn)
     loaders = {"train": DataLoader(datasets["train"], shuffle=True, drop_last=False, **kw), "val": DataLoader(datasets["val"], shuffle=False, **kw), "test": DataLoader(datasets["test"], shuffle=False, **kw)}
     model = load_pretrained(EnzymeSubstrateRegressor().to(device), PRETRAINED_MODEL, device)
-    loss_fn = nn.SmoothL1Loss(beta=1.0)
+    loss_fn = nn.SmoothL1Loss(beta=1.0, reduction="none")   # 逐样本损失，供加权
     print("\n========== STAGE 1: TRAIN FC4 ==========")
     stage1_path = os.path.join(MODEL_DIR, "stage1_best.pth")
     train_stage(model, loaders["train"], loaders["val"], device, loss_fn, STAGE1_EPOCHS, STAGE1_PATIENCE, STAGE1_LR, list(model.fc4.parameters()), y_mean, y_std, stage1_path)
